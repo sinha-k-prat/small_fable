@@ -301,6 +301,12 @@ def main():
     else:
         model = JointModel.from_base(args.base, device=args.device, plan_max_len=args.plan_max_len)
     print(f"[sft] trainable backbone (LoRA) tensors: {model.n_trainable_backbone()}")
+    try:   # trade compute for activation memory so fp32 1.5B + KL base forward fits a T4
+        model.backbone.gradient_checkpointing_enable()
+        model.backbone.enable_input_require_grads()
+        print("[sft] gradient checkpointing ON (lower activation memory).")
+    except Exception as e:
+        print(f"[sft] gradient checkpointing unavailable ({e})")
     if resume_state is None:
         print("[sft] initial held:",
               json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))

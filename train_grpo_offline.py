@@ -196,6 +196,15 @@ def main():
     assert n_bb > 0, "FROZEN-BACKBONE BUG: 0 trainable backbone tensors -> RL is a no-op."
     print(f"[grpo] >0 trainable backbone tensors: {n_bb} (≈336 expected) -- RL will actually move.")
 
+    # T4 memory: the fp32 1.5B + three forward graphs over a group of G don't fit at full activation
+    # footprint. Gradient checkpointing recomputes activations in backward instead of storing them.
+    try:
+        model.backbone.gradient_checkpointing_enable()
+        model.backbone.enable_input_require_grads()   # needed for checkpointing with inputs_embeds
+        print("[grpo] gradient checkpointing ON (lower activation memory).")
+    except Exception as e:
+        print(f"[grpo] gradient checkpointing unavailable ({e})")
+
     groups = load_groups(args.rollouts, use_filter=args.filter, exclude_rubric=args.exclude_rubric)
     assert groups, "no groups left after filtering — loosen --no-filter or regenerate hotter rollouts"
 

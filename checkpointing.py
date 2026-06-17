@@ -76,7 +76,8 @@ class Checkpointer:
         self.api = None
         self._last = time.time()
         if hf_repo:
-            tok = hf_token or os.environ.get("HF_TOKEN")
+            # empty string is WORSE than None: '' -> "Bearer " illegal header; None -> cached login.
+            tok = (hf_token or os.environ.get("HF_TOKEN")) or None
             try:
                 from huggingface_hub import HfApi, create_repo
                 create_repo(hf_repo, repo_type="model", exist_ok=True, private=False, token=tok)
