@@ -1,5 +1,8 @@
 # Adaptive planner-head small agent (SFT → offline GRPO)
 
+> 🎬 **[Core ideas, animated →](https://sinha-k-prat.github.io/small_fable/)** &nbsp;·&nbsp;
+> ▶️ **[Run the full pipeline on Colab (GPU) →](https://colab.research.google.com/github/sinha-k-prat/small_fable/blob/main/train_all_colab.ipynb)**
+
 A small model trained to behave like an **adaptive agent that switches mode from response to
 response**. A **planner head** emits a short plan (a sequence of primitives) per input; the shared
 backbone (**executor**) then produces the answer **conditioned on that plan**. Two training stages:
