@@ -138,3 +138,40 @@ inline comments in each file.
     `annotate_reward_paths.py`. *Why:* exercises the full graded/variance-weighted path honestly; for
     real conclusions, swap in real tasks (same schema) or expand with `build_sensitivity_corpus.py`,
     which filters tasks for `P(correct|plan) ≫ P(correct|no plan)` so RL has guaranteed variance.
+
+## Reasoning-traces pipeline (supersedes the synthetic path)
+
+23. **Train on real hard-reasoning traces, not synthetic templates.** `traces/` holds 3×1000 traces
+    + machine-readable answer keys. The three sets are a *controlled* experiment: 2000 is
+    "one-step-deeper" and 3000 is "flipped-answer" variations of 1000, so a model that memorized 1000
+    must REASON to solve them. *Why:* the synthetic set proved the pipeline but the plan wasn't
+    load-bearing on it; these traps (off-by-one, non-transitive chaining, knaves) need the plan.
+
+24. **Factored, parameterized plans from a single autoregressive head.** A plan is a flat token
+    sequence of primitives + `key=value` parameter-atoms + `END`
+    (`MODEL as=truth_table ... FINALIZE form=yes_no END`), emitted by one head. The parameters are the
+    load-bearing strategy (`reason=naive_vs_correct`, `watch=escape_midcycle`, `prop=transitive`).
+    *Why:* keeping parameters (not stripping them) is what makes the plan carry answer-determining
+    info; the factored sub-token form keeps the head a single fixed action space while staying
+    compositional — a novel primitive+param pairing is a novel sequence of known tokens. The vocab is
+    written to `plan_vocab.json` by `traces_to_sft.py` and loaded by `model_joint.py` (default 41-token
+    bare vocab if absent). `plan_max_len=24`.
+
+25. **Executor target = reasoning prose + `FINAL ANSWER: <canonical>`.** The executor learns to reason
+    in text and then commit a canonical answer (GSM8K-style). *Why:* coherent reasoning AND precise
+    grading — the checker reads only the committed span, so garden-path prose that names wrong answers
+    mid-reasoning doesn't fool it.
+
+26. **Per-example answer-key graders.** `checkers.py` implements the answer-key `match.type`s:
+    `exact_choice, numeric, numeric_or_word, exact_term, role_map, string_contains, plan_rubric`
+    (with contraction + number-word handling). Verifiable types route `reward_path=verifiable`;
+    `role_map`/`plan_rubric` route `rubric`. *Why:* one binary keyword checker false-matches ("no"
+    inside "cannot"); per-type grading of the FINAL ANSWER span calibrates to gold-passes-100% /
+    wrong-scores-0.
+
+27. **Split: train 1000+2000, hold out 3000 (flipped) entirely.** Plus a seeded shuffle so the
+    in-distribution held slice is representative. *Why:* a 90/10 pool would let the model see flipped
+    variations and memorize them; holding the flipped set out keeps the memorize-vs-reason test honest.
+
+28. **Resume guard also checks `n_plan` (vocab size).** *Why:* the planner head is sized to the vocab;
+    a checkpoint from a different vocab must not be loaded into a differently-sized model.

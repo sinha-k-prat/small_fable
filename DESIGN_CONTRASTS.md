@@ -296,3 +296,73 @@ thought through, not just a stock GRPO wiring:
                                                                     ▼
                                                    ablation: with-plan vs no-plan  ★4
 ```
+
+---
+
+## E · Reasoning-traces era (real data + compositional plans)
+
+These supersede the synthetic-data choices above for the current pipeline.
+
+### 25. The training data
+```
+        ✗ template-generated synthetic tasks (toy; plan often redundant)
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ hard reasoning traces (3×1000) — designed so a model that MEMORIZED one set
+          must REASON to solve the deeper (2000) and flipped-answer (3000) variations
+```
+**Why:** real traps (off-by-one, non-transitive chaining, knaves) where the plan genuinely matters.
+
+### 26. The plan's parameters
+```
+        ✗ strip parameters: REFLECT[reason=naive_vs_correct] -> bare REFLECT
+          1000 problems collapse to 18 generic plans -> plan carries no answer info -> redundant
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ KEEP the parameters — they ARE the strategy (reason=off_by_one, watch=escape_midcycle,
+          prop=transitive). With them the executor dodges the trap; without them it falls in.
+```
+**Why:** the parameter is the load-bearing decision; stripping it is what made the gap non-positive.
+
+### 27. How parameters enter the vocab
+```
+        ✗ atomic compound tokens MODEL[as=rate] (welds primitive to params; no composition;
+          a primitive+param combo unseen in training is unrepresentable)   —or—   two planner heads
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ ONE autoregressive head over a FACTORED vocab: primitive and key=value are separate tokens
+          MODEL as=rate VERIFY aspect=units ... FINALIZE form=number_with_units END
+```
+**Why:** a novel primitive+param pairing is just a novel sequence of known tokens — compositional,
+single head, no extra machinery.
+
+### 28. The executor target
+```
+        ✗ terse final answer ("9 days")  -> can't solve hard problems, output incoherent
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ full reasoning prose + "FINAL ANSWER: <canonical>"  (GSM8K-style commit)
+```
+**Why:** the model learns to reason AND commits a clean answer the checker can grade precisely.
+
+### 29. The verifiable reward
+```
+        ✗ one binary keyword checker for everything (false-matches: "no" inside "cannot")
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ per-example answer-key graders (exact_choice / numeric / numeric_or_word / exact_term /
+          role_map / string_contains / plan_rubric), grading only the FINAL ANSWER span
+```
+**Why:** garden-path prose names wrong answers mid-reasoning; grade the commitment, not the prose.
+Calibration: gold passes its own checker 100%, wrong answers score 0.
+
+### 30. The held-out split
+```
+        ✗ rows[train:train+held] — a fixed positional slice (ordering-biased)
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ seeded shuffle of the corpus -> representative random held slice (consistent across stages)
+```
+
+### 31. The generalization test
+```
+        ✗ pool all 3 sets, 90/10 random split  (model SEES flipped variations -> can memorize them)
+   ───────────────────────────────────── instead ─────────────────────────────────────
+        ✓ train on sets 1000+2000, hold out set 3000 (flipped-answer) ENTIRELY as the unseen test
+```
+**Why:** keeps the controlled memorize-vs-reason experiment — holding on the flipped set is the
+claim that can't be faked by pattern-matching.

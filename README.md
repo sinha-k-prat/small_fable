@@ -13,8 +13,8 @@
 > ⚖️ **[Design contrasts (rejected vs chosen) →](DESIGN_CONTRASTS.md)**
 
 A small model trained to behave like an **adaptive agent that switches mode from response to
-response**. A **planner head** emits a short plan (a sequence of primitives) per input; the shared
-backbone (**executor**) then produces the answer **conditioned on that plan**. Two training stages:
+response**. A **planner head** emits a short plan per input; the shared backbone (**executor**) then
+produces the answer **conditioned on that plan**. Two training stages:
 
 1. **SFT** on gold `(instruction → plan, answer)` pairs.
 2. **Offline GRPO** that improves executor + planner from the model's *own sampled* rollouts, scored
@@ -22,6 +22,14 @@ backbone (**executor**) then produces the answer **conditioned on that plan**. T
 
 The headline property is that the **plan is load-bearing**: the answer depends on the plan chosen.
 We measure this directly with the **plan-vs-no-plan ablation gap**.
+
+> **Current pipeline (hard reasoning traces).** The live experiment trains on real **hard reasoning
+> traces** ([`traces/`](traces/)) where the plan is **factored and parameterized** — a single
+> autoregressive head emits a flat sequence of primitives + `key=value` strategy-atoms
+> (`MODEL as=truth_table … FINALIZE form=yes_no END`), and the executor **reasons in prose, then
+> commits a `FINAL ANSWER`**. It trains on sets 1000+2000 and **holds out the flipped-answer set 3000**
+> as an unseen *memorize-vs-reason* generalization test. See [`PRIMITIVES.md`](PRIMITIVES.md),
+> [`DESIGN_CONTRASTS.md`](DESIGN_CONTRASTS.md) §E, and [`important_design_choices.md`](important_design_choices.md).
 
 ## Architecture (one model, two heads, LoRA everywhere)
 - **Executor** = `Qwen/Qwen2.5-1.5B-Instruct` causal LM + **LoRA on all 7 projection matrices**
