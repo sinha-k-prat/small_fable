@@ -106,7 +106,11 @@ def main():
     ap.add_argument('--answers', nargs='+', default=[], help='answers_*.jsonl (join key = instruction)')
     ap.add_argument('--out', default='dataset/traces_sft.jsonl')
     ap.add_argument('--vocab_out', default='plan_vocab.json',
-                    help='write the planner vocab (refined primitives + FINALIZE terminator) here')
+                    help='write the planner vocab (primitives + param-atoms + END) here')
+    ap.add_argument('--shuffle', action='store_true', default=True,
+                    help='shuffle the corpus (seeded) so the train/held split is representative')
+    ap.add_argument('--no-shuffle', dest='shuffle', action='store_false')
+    ap.add_argument('--seed', type=int, default=20260616)
     args = ap.parse_args()
     import os
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
@@ -116,23 +120,27 @@ def main():
         for line in open(path):
             a = json.loads(line); key[a['instruction']] = a
 
-    n, matched = 0, 0
-    vocab_order, seen = [], set()                          # collect refined primitives in first-seen order
+    recs, matched = [], 0
+    for path in args.traces:
+        for line in open(path):
+            row = json.loads(line)
+            ak = key.get(row['instruction'])
+            matched += ak is not None
+            recs.append(convert(row, ak, len(recs)))
+    if args.shuffle:                                       # representative train/held split
+        import random
+        random.Random(args.seed).shuffle(recs)
+    vocab_order, seen = [], set()
     with open(args.out, 'w') as f:
-        for path in args.traces:
-            for line in open(path):
-                row = json.loads(line)
-                ak = key.get(row['instruction'])
-                matched += ak is not None
-                rec = convert(row, ak, n)
-                for p in rec['plan']:
-                    if p not in seen:
-                        seen.add(p); vocab_order.append(p)
-                f.write(json.dumps(rec, ensure_ascii=False) + '\n')
-                n += 1
+        for rec in recs:
+            for p in rec['plan']:
+                if p not in seen:
+                    seen.add(p); vocab_order.append(p)
+            f.write(json.dumps(rec, ensure_ascii=False) + '\n')
     vocab = ['PAD'] + vocab_order
     json.dump({'vocab': vocab, 'terminator': END}, open(args.vocab_out, 'w'), indent=1)
-    print(f"wrote {n} rows -> {args.out}  (answer-key matched {matched}/{n})")
+    print(f"wrote {len(recs)} rows -> {args.out}  (answer-key matched {matched}/{len(recs)}, "
+          f"shuffled={args.shuffle})")
     print(f"wrote {args.vocab_out}: {len(vocab)} tokens (primitives + param-atoms), terminator={END}")
 
 if __name__ == '__main__':
