@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Core Ideas · small_fable</title>
+
+<!-- React + ReactDOM (UMD) + Babel standalone for in-browser JSX, and Anime.js for animation.
+     All from CDN, so this file works by double-click (file://) and on GitHub Pages. -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
+
+<style>
+  :root {
+    --bg:        #0e0f13;
+    --panel:     #16181f;
+    --panel-2:   #1d2029;
+    --line:      #2a2e3a;
+    --ink:       #e9e7e0;
+    --muted:     #8b909c;
+    --amber:     #f5b942;
+    --teal:      #3ddc97;
+    --violet:    #9b8cff;
+    --rose:      #ff6b8b;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --mono:  ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans:  system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: radial-gradient(1200px 600px at 80% -10%, #1a1d27 0%, var(--bg) 55%) fixed;
+    color: var(--ink);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  #root { min-height: 100%; }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 24px 80px; }
+
+  /* ---------- header ---------- */
+  .masthead { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+              border-bottom: 1px solid var(--line); padding-bottom: 22px; margin-bottom: 36px; }
+  .brand { font-family: var(--mono); font-size: 12px; letter-spacing: .32em;
+           text-transform: uppercase; color: var(--amber); }
+  .title { font-family: var(--serif); font-size: clamp(30px, 5vw, 52px); line-height: 1.02;
+           margin: 0; font-weight: 600; letter-spacing: -.01em; }
+  .subtitle { color: var(--muted); font-size: 15px; max-width: 56ch; margin: 10px 0 0; }
+
+  /* ---------- grid ---------- */
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .card {
+    position: relative; text-align: left; cursor: pointer; color: inherit;
+    background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+    border: 1px solid var(--line); border-radius: 14px; padding: 22px 20px 20px;
+    font: inherit; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+    overflow: hidden;
+  }
+  .card:hover, .card:focus-visible { transform: translateY(-4px); border-color: #3a4150;
+    box-shadow: 0 14px 40px -18px rgba(0,0,0,.8); outline: none; }
+  .card:focus-visible { border-color: var(--amber); box-shadow: 0 0 0 2px rgba(245,185,66,.35); }
+  .card .num { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: .2em; }
+  .card .ct  { font-family: var(--serif); font-size: 22px; margin: 10px 0 8px; line-height: 1.12; }
+  .card .cs  { color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+  .card .swatch { position: absolute; top: 0; left: 0; height: 3px; width: 100%; }
+  .card .go { font-family: var(--mono); font-size: 11px; color: var(--ink); margin-top: 16px;
+              display: inline-flex; align-items: center; gap: 6px; opacity: .65; }
+  .card:hover .go, .card:focus-visible .go { opacity: 1; }
+
+  /* ---------- detail ---------- */
+  .detail { animation: rise .35s ease both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  .back { font: inherit; font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
+          color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+          border-radius: 999px; padding: 9px 16px; cursor: pointer; display: inline-flex;
+          align-items: center; gap: 8px; transition: border-color .15s, background .15s; }
+  .back:hover, .back:focus-visible { border-color: var(--amber); background: var(--panel-2); outline: none; }
+  .detail h2 { font-family: var(--serif); font-size: clamp(28px, 4.5vw, 44px); margin: 26px 0 6px;
+               line-height: 1.05; letter-spacing: -.01em; }
+  .detail .kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .28em;
+                    text-transform: uppercase; }
+  .detail p.lead { color: var(--muted); font-size: 16px; line-height: 1.6; max-width: 62ch; margin: 8px 0 26px; }
+
+  .stage { position: relative; height: 360px; border: 1px solid var(--line); border-radius: 16px;
+           background: repeating-linear-gradient(0deg, transparent, transparent 31px, rgba(255,255,255,.02) 32px),
+                       linear-gradient(180deg, #12141b, #0c0d12);
+           overflow: hidden; }
+  .stage svg { display: block; width: 100%; height: 100%; }
+  .replay { position: absolute; right: 14px; bottom: 12px; z-index: 5; }
+
+  .footnote { color: var(--muted); font-size: 12.5px; font-family: var(--mono);
+              margin-top: 22px; border-top: 1px solid var(--line); padding-top: 16px; }
+
+  /* anime targets often start hidden; reduced-motion users get them shown immediately via JS. */
+  @media (prefers-reduced-motion: reduce) { .detail, .card { animation: none !important; } }
+</style>
+</head>
+<body>
+<div id="root" aria-live="polite"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ============================================================================
+   HOW TO ADD AN IDEA
+   Append one object to IDEAS below:
+     { id, title, summary, color, animation }
+   - color: accent used for the card stripe + detail kicker.
+   - animation(stage, reduced): receives the .stage DOM node and a boolean for
+     prefers-reduced-motion. Build your SVG/markup inside `stage`, then drive it
+     with anime(...). Return an anime timeline (or anything) — it's auto-cleaned.
+   That's it. The grid, routing, keyboard access, and replay button are automatic.
+   ============================================================================ */
+
+// ---- small helpers for the SVG scenes ----
+const NS = "http://www.w3.org/2000/svg";
+function svg(stage, vb = "0 0 800 360") {
+  stage.innerHTML = "";
+  const s = document.createElementNS(NS, "svg");
+  s.setAttribute("viewBox", vb);
+  s.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  stage.appendChild(s);
+  return s;
+}
+function el(parent, tag, attrs = {}, text) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text != null) n.textContent = text;
+  parent.appendChild(n);
+  return n;
+}
+const LABEL = { "font-family": "ui-monospace, Menlo, monospace", "font-size": 13, fill: "#8b909c" };
+
+// ============================================================================
+// THE IDEAS  (seeded with small_fable's real core ideas — edit freely)
+// ============================================================================
+const IDEAS = [
+  {
+    id: "joint",
+    title: "Joint Planner–Executor",
+    summary: "One model emits a short symbolic PLAN, then writes the answer conditioned on it. Two heads, one backbone.",
+    color: "var(--teal)",
+    note: "plan_ce + λ·resp_ce + λ_kl·KL — trained together so the plan actually steers the answer.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      const plan = ["GENERATE_ALT","EVAL","SELECT","VERIFY","TERMINATE"];
+      // planner lane (top) -> tokens flow down into the executor lane (bottom)
+      el(s, "text", { x: 40, y: 54, ...LABEL, fill: "#3ddc97" }, "PLANNER");
+      el(s, "text", { x: 40, y: 250, ...LABEL, fill: "#f5b942" }, "EXECUTOR");
+      const chips = plan.map((t, i) => {
+        const g = el(s, "g", {});
+        const x = 150 + i * 118;
+        el(g, "rect", { x, y: 36, width: 104, height: 30, rx: 8, fill: "#10241d",
+                        stroke: "#3ddc97", "stroke-width": 1.2 });
+        el(g, "text", { x: x + 52, y: 56, "text-anchor": "middle",
+                        "font-family": "ui-monospace, monospace", "font-size": 11, fill: "#7ef0c0" }, t);
+        return g;
+      });
+      // the answer being written token by token at the bottom
+      const ans = "Daily profit = $3450.".split("");
+      const ansNodes = ans.map((c, i) =>
+        el(s, "text", { x: 150 + i * 15, y: 280, "font-family": "var(--serif)",
+                        "font-size": 22, fill: "#f5b942", opacity: 0 }, c));
+      // conditioning beam from plan -> answer
+      const beam = el(s, "path", { d: "M150,70 C 360,150 360,210 150,250", fill: "none",
+                                   stroke: "#3a4150", "stroke-width": 1.5, "stroke-dasharray": "5 6", opacity: 0 });
+      if (reduced) { chips.forEach(c => c.setAttribute("opacity", 1));
+                     ansNodes.forEach(n => n.setAttribute("opacity", 1)); beam.setAttribute("opacity",.6); return; }
+      const tl = anime.timeline({ easing: "easeOutCubic" });
+      tl.add({ targets: chips, opacity: [0,1], translateY: [-16,0], delay: anime.stagger(110), duration: 420 })
+        .add({ targets: beam, opacity: [0,.7], duration: 500 }, "-=200")
+        .add({ targets: ansNodes, opacity: [0,1], translateY: [8,0], delay: anime.stagger(28), duration: 260 }, "-=100");
+      return tl;
+    },
+  },
+  {
+    id: "loadbearing",
+    title: "Load-Bearing Plans",
+    summary: "Decode with the gold plan vs. with no plan. The accuracy gap proves the plan is doing real work — not decoration.",
+    color: "var(--amber)",
+    note: "ablation_gap = acc(plan) − acc(no-plan). Positive and growing under curriculum = the plan carries weight.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      const baseY = 300, h = 200;
+      const cols = [
+        { x: 230, label: "NO PLAN", val: 0.34, c: "#5a6072" },
+        { x: 470, label: "WITH PLAN", val: 0.82, c: "#f5b942" },
+      ];
+      el(s, "line", { x1: 120, y1: baseY, x2: 700, y2: baseY, stroke: "#2a2e3a", "stroke-width": 1.5 });
+      const bars = cols.map(col => {
+        const bh = col.val * h;
+        const r = el(s, "rect", { x: col.x, y: baseY, width: 150, height: 0, rx: 6, fill: col.c });
+        el(s, "text", { x: col.x + 75, y: baseY + 26, "text-anchor": "middle", ...LABEL }, col.label);
+        const pct = el(s, "text", { x: col.x + 75, y: baseY - bh - 12, "text-anchor": "middle",
+                       "font-family": "var(--serif)", "font-size": 22, fill: col.c, opacity: 0 },
+                       Math.round(col.val*100) + "%");
+        return { r, pct, bh, y: baseY - bh };
+      });
+      // the "gap" bracket
+      const gap = el(s, "g", { opacity: 0 });
+      el(gap, "line", { x1: 640, y1: bars[0].y, x2: 640, y2: bars[1].y, stroke: "#3ddc97", "stroke-width": 2 });
+      el(gap, "text", { x: 656, y: (bars[0].y+bars[1].y)/2, "font-family": "ui-monospace, monospace",
+                        "font-size": 14, fill: "#3ddc97" }, "gap = +48%");
+      if (reduced) { bars.forEach(b => { b.r.setAttribute("y", b.y); b.r.setAttribute("height", b.bh);
+                     b.pct.setAttribute("opacity",1); }); gap.setAttribute("opacity",1); return; }
+      const tl = anime.timeline({ easing: "easeOutElastic(1, .8)" });
+      bars.forEach((b, i) => {
+        tl.add({ targets: b.r, height: b.bh, y: b.y, duration: 900 }, i * 350)
+          .add({ targets: b.pct, opacity: [0,1], duration: 300, easing: "easeOutQuad" }, "-=500");
+      });
+      tl.add({ targets: gap, opacity: [0,1], duration: 500, easing: "easeOutQuad" });
+      return tl;
+    },
+  },
+  {
+    id: "isratio",
+    title: "Off-Policy IS Correction",
+    summary: "Rollouts are cached, then reused for several gradient steps. As the policy drifts, each token's gradient is rescaled by a clipped importance ratio.",
+    color: "var(--violet)",
+    note: "ratio = exp(logp_new − logp_old), clipped to [1−ε, 1+ε]. It corrects staleness — it is not a reward bonus.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      const midY = 180;
+      el(s, "text", { x: 400, y: 40, "text-anchor": "middle", ...LABEL }, "importance ratio = exp(logp_new − logp_old)");
+      // clip band
+      const top = 110, bot = 250;
+      el(s, "rect", { x: 120, y: top, width: 560, height: bot-top, fill: "rgba(155,140,255,.07)",
+                      stroke: "#9b8cff", "stroke-dasharray": "4 5", "stroke-width": 1 });
+      el(s, "text", { x: 130, y: top - 8, ...LABEL, fill: "#9b8cff" }, "1+ε");
+      el(s, "text", { x: 130, y: bot + 18, ...LABEL, fill: "#9b8cff" }, "1−ε");
+      el(s, "line", { x1: 120, y1: midY, x2: 680, y2: midY, stroke: "#2a2e3a", "stroke-dasharray": "2 6" });
+      el(s, "text", { x: 686, y: midY+4, ...LABEL }, "1.0");
+      // tokens drift away from ratio=1, then get clipped back into the band
+      const N = 9;
+      const dots = [], drift = [], clipped = [];
+      for (let i = 0; i < N; i++) {
+        const x = 170 + i * 58;
+        const d = (Math.sin(i*1.7)*1.0 + (i%3-1)*0.7); // raw drift, some outside band
+        drift.push(midY - d * 70);
+        clipped.push(Math.max(top+10, Math.min(bot-10, midY - d * 70)));
+        dots.push(el(s, "circle", { cx: x, cy: midY, r: 7, fill: "#9b8cff" }));
+      }
+      if (reduced) { dots.forEach((dt,i)=>dt.setAttribute("cy", clipped[i])); return; }
+      const tl = anime.timeline();
+      tl.add({ targets: dots, cy: (e,i)=>drift[i], duration: 800, delay: anime.stagger(40), easing: "easeOutQuad" })
+        .add({ targets: dots, cy: (e,i)=>clipped[i], duration: 700, delay: anime.stagger(40),
+               easing: "easeInOutBack", fill: (e,i)=> drift[i]!==clipped[i] ? "#ff6b8b" : "#9b8cff" }, "+=250")
+        .add({ targets: dots, r: [7,9,7], duration: 400, delay: anime.stagger(30) }, "-=400");
+      return tl;
+    },
+  },
+  {
+    id: "groupadv",
+    title: "Group-Relative Advantage",
+    summary: "Sample G answers for one prompt. Each answer's advantage is its reward minus the group mean — no learned value critic needed.",
+    color: "var(--teal)",
+    note: "Â_i = r_i − mean(r_group). Above the line → reinforced; below → suppressed. The group is its own baseline.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      const meanY = 180, base = 170;
+      const rewards = [0.9, 0.2, 0.7, 0.1, 1.0, 0.4, 0.85, 0.3];
+      const mean = rewards.reduce((a,b)=>a+b,0)/rewards.length;
+      el(s, "text", { x: 70, y: meanY - 8, ...LABEL, fill:"#3ddc97" }, "group mean");
+      const meanLine = el(s, "line", { x1: 150, y1: meanY, x2: 700, y2: meanY,
+                          stroke: "#3ddc97", "stroke-width": 2, "stroke-dasharray": "6 6", opacity: 0 });
+      const bars = rewards.map((r, i) => {
+        const x = 175 + i * 66;
+        const y = meanY - (r - mean) * base;
+        const above = r >= mean;
+        const rect = el(s, "rect", { x, y: meanY, width: 44, height: 0, rx: 5,
+                        fill: above ? "#3ddc97" : "#ff6b8b", opacity: .9 });
+        return { rect, y, above, h: Math.abs(y - meanY), x };
+      });
+      if (reduced) { meanLine.setAttribute("opacity",1);
+        bars.forEach(b => { b.rect.setAttribute("y", Math.min(b.y, meanY));
+        b.rect.setAttribute("height", b.h); }); return; }
+      const tl = anime.timeline({ easing: "easeOutCubic" });
+      tl.add({ targets: meanLine, opacity: [0,1], duration: 500 })
+        .add({ targets: bars.map(b=>b.rect),
+               height: (e,i)=>bars[i].h,
+               y: (e,i)=> Math.min(bars[i].y, meanY),
+               duration: 700, delay: anime.stagger(70) }, "-=150");
+      return tl;
+    },
+  },
+  {
+    id: "curriculum",
+    title: "Curriculum: Broad → Hard",
+    summary: "Train broadly first, then let the model itself select the prompts it rarely solves and train a second pass only on those.",
+    color: "var(--rose)",
+    note: "Keep a prompt for stage 2 if solved ≤ 2 of 8 samples. Plans become MORE load-bearing on the hard tail.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      el(s, "text", { x: 150, y: 40, ...LABEL }, "full set");
+      el(s, "text", { x: 560, y: 40, ...LABEL, fill: "#ff6b8b" }, "hard subset");
+      // funnel walls
+      el(s, "path", { d: "M120,70 L520,150 L520,210 L120,290 Z", fill: "rgba(255,107,139,.05)",
+                      stroke: "#2a2e3a" });
+      const rows = 6, cols = 7;
+      const dots = [];
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const x = 140 + c * 48, y = 92 + r * 34;
+        const hard = ((r*cols+c) % 5 === 0); // ~1/5 are "hard"
+        dots.push({ node: el(s, "circle", { cx: x, cy: y, r: 8,
+          fill: hard ? "#ff6b8b" : "#3a4150" }), hard, x, y });
+      }
+      if (reduced) { dots.forEach(d => { if (!d.hard) d.node.setAttribute("opacity", .12);
+        else { d.node.setAttribute("cx", 600); } }); return; }
+      const tl = anime.timeline({ easing: "easeInOutQuad" });
+      tl.add({ targets: dots.map(d=>d.node), opacity: [0,1], scale: [0,1],
+               delay: anime.stagger(12, {grid:[cols,rows], from:"first"}), duration: 400 })
+        .add({ targets: dots.filter(d=>!d.hard).map(d=>d.node), opacity: .1, duration: 700 }, "+=300")
+        .add({ targets: dots.filter(d=>d.hard).map(d=>d.node),
+               cx: (e,i)=> 575 + (i%2)*36, cy: (e,i)=> 120 + Math.floor(i/2)*40,
+               duration: 900, delay: anime.stagger(60), easing: "easeInOutBack" }, "-=300")
+        .add({ targets: dots.filter(d=>d.hard).map(d=>d.node), r:[8,11,8], duration: 500,
+               delay: anime.stagger(60) }, "-=600");
+      return tl;
+    },
+  },
+  {
+    id: "maxent",
+    title: "MaxEnt Prompt Weighting",
+    summary: "Weight each prompt by how much learning signal its group carries. Prompts everyone gets right (or all wrong) contribute nothing.",
+    color: "var(--violet)",
+    note: "A bell on group accuracy p_q: peak weight near 0.5, near-zero at p_q∈{0,1}. Replaces the zero-variance-deletion hack.",
+    animation(stage, reduced) {
+      const s = svg(stage);
+      const x0 = 130, x1 = 690, yb = 290, peak = 80;
+      el(s, "line", { x1: x0, y1: yb, x2: x1, y2: yb, stroke: "#2a2e3a", "stroke-width": 1.5 });
+      el(s, "text", { x: x0, y: yb + 22, ...LABEL }, "p_q=0 (all wrong)");
+      el(s, "text", { x: x1-150, y: yb + 22, ...LABEL }, "p_q=1 (all right)");
+      el(s, "text", { x: (x0+x1)/2 - 16, y: yb + 22, ...LABEL, fill:"#9b8cff" }, "0.5");
+      // bell path
+      const pts = [];
+      for (let i = 0; i <= 60; i++) {
+        const t = i/60, x = x0 + t*(x1-x0);
+        const y = yb - (peak * 2.4) * Math.exp(-Math.pow((t-0.5)/0.18, 2)/2);
+        pts.push([x, y]);
+      }
+      const d = "M" + pts.map(p=>p.join(",")).join(" L");
+      const bell = el(s, "path", { d, fill: "none", stroke: "#9b8cff", "stroke-width": 2.5 });
+      const len = bell.getTotalLength();
+      // sample groups placed along the axis; their dot size = weight
+      const samples = [0.0, 0.18, 0.5, 0.72, 1.0];
+      const marks = samples.map(p => {
+        const x = x0 + p*(x1-x0);
+        const w = Math.exp(-Math.pow((p-0.5)/0.18,2)/2);
+        const y = yb - (peak*2.4)*w;
+        const c = el(s, "circle", { cx: x, cy: yb, r: 0, fill: "#f5b942" });
+        return { c, x, y, w };
+      });
+      if (reduced) { bell.setAttribute("stroke-dasharray","none");
+        marks.forEach(m => { m.c.setAttribute("cy", m.y); m.c.setAttribute("r", 4 + m.w*9); }); return; }
+      bell.setAttribute("stroke-dasharray", len);
+      bell.setAttribute("stroke-dashoffset", len);
+      const tl = anime.timeline({ easing: "easeOutCubic" });
+      tl.add({ targets: bell, strokeDashoffset: [len, 0], duration: 1100, easing: "easeInOutSine" })
+        .add({ targets: marks.map(m=>m.c), cy: (e,i)=>marks[i].y, r: (e,i)=> 4 + marks[i].w*9,
+               duration: 700, delay: anime.stagger(90) }, "-=500")
+        .add({ targets: marks.filter(m=>m.w<0.05).map(m=>m.c), opacity:[1,.2], duration: 500 }, "-=200");
+      return tl;
+    },
+  },
+];
+
+// ============================================================================
+// UI
+// ============================================================================
+const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function Card({ idea, index, onOpen }) {
+  const onKey = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(idea.id); }
+  };
+  return (
+    <div className="card" role="button" tabIndex={0} aria-label={`Open: ${idea.title}`}
+         onClick={() => onOpen(idea.id)} onKeyDown={onKey}>
+      <span className="swatch" style={{ background: idea.color }} />
+      <div className="num">IDEA {String(index + 1).padStart(2, "0")}</div>
+      <div className="ct">{idea.title}</div>
+      <div className="cs">{idea.summary}</div>
+      <div className="go">open ↗</div>
+    </div>
+  );
+}
+
+function Detail({ idea, onBack }) {
+  const stageRef = useRef(null);
+  const animRef = useRef(null);
+  const backRef = useRef(null);
+
+  const play = useCallback(() => {
+    if (animRef.current && animRef.current.pause) animRef.current.pause();
+    if (stageRef.current) animRef.current = idea.animation(stageRef.current, prefersReduced);
+  }, [idea]);
+
+  useEffect(() => {
+    play();
+    if (backRef.current) backRef.current.focus();
+    const onKey = (e) => { if (e.key === "Escape") onBack(); };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      if (animRef.current && animRef.current.pause) animRef.current.pause();
+    };
+  }, [idea, play, onBack]);
+
+  const idx = IDEAS.findIndex(i => i.id === idea.id);
+  return (
+    <div className="detail">
+      <button className="back" ref={backRef} onClick={onBack}>← all ideas</button>
+      <div className="kicker" style={{ color: idea.color }}>
+        IDEA {String(idx + 1).padStart(2, "0")}
+      </div>
+      <h2>{idea.title}</h2>
+      <p className="lead">{idea.summary}</p>
+      <div className="stage" ref={stageRef} aria-hidden="true">
+        <button className="back replay" onClick={play} aria-label="Replay animation">↻ replay</button>
+      </div>
+      {idea.note && <div className="footnote">{idea.note}</div>}
+    </div>
+  );
+}
+
+function App() {
+  const [selected, setSelected] = useState(null);
+  const idea = IDEAS.find(i => i.id === selected);
+  return (
+    <div className="wrap">
+      <header className="masthead">
+        <span className="brand">small_fable</span>
+        <div>
+          <h1 className="title">Core Ideas, in Motion</h1>
+          <p className="subtitle">
+            Six concepts behind the joint planner–executor pipeline — each one animated to
+            show what it actually <em>does</em>. Click a card, or tab + Enter.
+          </p>
+        </div>
+      </header>
+
+      {idea
+        ? <Detail idea={idea} onBack={() => setSelected(null)} />
+        : <div className="grid">
+            {IDEAS.map((it, i) => (
+              <Card key={it.id} idea={it} index={i} onOpen={setSelected} />
+            ))}
+          </div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
