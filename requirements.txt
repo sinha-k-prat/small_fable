@@ -1,0 +1,8 @@
+# Core. transformers >= 4.51 is the spec target (Qwen2.5 works from 4.44; pin newer for fixes).
+torch>=2.2
+transformers>=4.51
+peft>=0.11
+accelerate>=0.30
+safetensors>=0.4
+# optional: only if you want to cross-check against a reference GRPO impl
+# trl>=0.9

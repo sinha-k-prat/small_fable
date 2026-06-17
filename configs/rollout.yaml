@@ -1,0 +1,11 @@
+# Stage 2a offline rollout defaults (mirror rollout_offline.py CLI flags).
+sft_ckpt: joint_ckpt
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/sft_100.jsonl
+train: 80
+group: 8          # G rollouts per instruction -> group-relative advantages
+temp: 1.5         # HOT (1.3-1.6) so the 8 genuinely differ -> reward variance
+top_p: 0.98
+max_resp: 64
+out: rl_rollouts.jsonl
+device: cuda

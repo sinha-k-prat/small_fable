@@ -1,0 +1,14 @@
+# Stage 1 SFT defaults (mirror train_sft.py CLI flags; reference only — scripts read argparse).
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/sft_100.jsonl
+train: 70
+held: 30
+epochs: 6
+lr: 2.0e-5
+bs: 4
+lam_resp: 1.0      # weight on executor (answer) CE
+lam_kl: 0.1        # KL-to-base stability anchor (0 to disable)
+max_resp: 64
+plan_max_len: 12
+out: joint_ckpt
+device: cuda

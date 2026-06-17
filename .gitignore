@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Claude local settings
+.claude/settings.local.json
+
+# Training outputs / checkpoints (generated, large, regenerable)
+joint_ckpt/
+rl_ckpt/
+*_ckpt/
+*.ckpt
+*.pt
+*.safetensors
+
+# Rollout / generated artifacts
+rl_rollouts.jsonl
+*_rollouts.jsonl
+
+# Misc
+.DS_Store
+*.log
+wandb/

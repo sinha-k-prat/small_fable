@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+train_grpo_offline.py — Stage 2b: off-policy GRPO from the cached rollouts (no generation).
+
+Reads rl_rollouts.jsonl (contiguous blocks of G per instruction), recomputes the CURRENT
+policy's per-token logprobs for the saved plan/response tokens, and minimizes the off-policy
+clipped objective from grpo_offpolicy.joint_grpo_loss:
+
+    L = L_exec_clip + beta_plan * L_plan_clip + beta_ce * CE_plan_anchor
+
+The crux is OFF-POLICY CORRECTION. We reuse each group for `inner_epochs` gradient steps; after
+step 1 the policy drifts from the saved behavior policy, so each token's gradient is scaled by
+    ratio = exp(logp_new - logp_old)   (per token, clipped to [1-eps, 1+eps]).
+The ratio CORRECTS sampling staleness; it is not a reward bonus. On the first pass ratio==1, so
+this reduces to plain reinforce. Watch approx_kl per inner epoch — if it climbs past ~0.10-0.15
+the rollouts are stale: cut inner epochs (before cutting lr) and regenerate.
+
+Architecture-specific correctness (handled by grpo_offpolicy, fed correctly here):
+  (1) executor ratio is computed over RESPONSE tokens only — the resp logp tensor never contains
+      prompt or plan tokens, so plan logprobs cannot contaminate the executor ratio.
+  (2) planner and executor are SEPARATE action spaces -> two independent ratios/advantages.
+
+Addenda wired here:
+  A1/A1b  MaxEnt prompt weighting via adv_weights — verifiable prompts use mgpo_weight(p_q) (bell on
+          group accuracy), rubric/judge prompts use variance_weight (reward spread). Replaces the
+          "delete zero-variance groups" hack; logs the p_q histogram and mean weight per path.
+  A2      train only on keep=True groups (zero-spread groups dropped upstream in rollout_offline).
+  A5      --long2short: zero-sum brevity reward shaping among CORRECT trajectories, BEFORE advantages.
+  A6      logp_mismatch_t0 assertion before any update — the saved logp_old must match the trainer's
+          recomputed logp on the first pass, or the importance ratio is corrupted at step 0.
+
+Startup ASSERTS >0 trainable backbone tensors (guards the frozen-backbone no-op bug).
+
+CLI:
+  python train_grpo_offline.py --rollouts rl_rollouts.jsonl --sft_ckpt joint_ckpt \
+      --out rl_ckpt --inner_epochs 3 --lr 1e-4 --clip_eps 0.2 --beta_plan 1.0 --beta_ce 0.1 \
+      --device cuda
+"""
+import argparse, json, copy, time
+from collections import Counter
+import torch, torch.nn.functional as F
+
+from model_joint import JointModel, encode_plan, PAD_ID, decode_plan
+from grpo_offpolicy import (joint_grpo_loss, mgpo_weight, variance_weight, group_pq,
+                            long2short_shape)
+from checkers import graded_reward_for_row
+
+
+def load_groups(path, use_filter=True, exclude_rubric=False):
+    """Chunk the rollout file into contiguous groups of size group_size.
+    A2: drop groups marked keep=False (no within-group spread -> no GRPO gradient).
+    --exclude_rubric: hold soft (rubric) families OUT of RL entirely (rely on SFT)."""
+    recs = [json.loads(l) for l in open(path)]
+    groups, i, n_drop_filter, n_drop_rubric = [], 0, 0, 0
+    while i < len(recs):
+        G = recs[i]["group_size"]
+        grp = recs[i:i+G]; i += G
+        if use_filter and not grp[0].get("keep", True):
+            n_drop_filter += 1; continue
+        if exclude_rubric and grp[0].get("reward_path") == "rubric":
+            n_drop_rubric += 1; continue
+        groups.append(grp)
+    print(f"[grpo] groups kept={len(groups)} dropped(A2 zero-spread)={n_drop_filter} "
+          f"dropped(rubric held-out)={n_drop_rubric}")
+    return groups
+
+
+def pad_to(seqs, fill, dtype, device):
+    L = max((len(s) for s in seqs), default=1)
+    L = max(L, 1)
+    out = torch.full((len(seqs), L), fill, dtype=dtype, device=device)
+    for i, s in enumerate(seqs):
+        if len(s):
+            out[i, :len(s)] = torch.tensor(s, dtype=dtype, device=device)
+    return out
+
+
+def build_group_tensors(model, group):
+    """From G rollout records -> padded tensors for one group (B=G)."""
+    instrs = [g["instruction"] for g in group]
+    p_ids, p_attn = model.batch_prompts(instrs)
+    plan_ids = pad_to([g["plan_tokens"] for g in group], PAD_ID, torch.long, model.device)
+    resp_ids = pad_to([g["resp_tokens"] for g in group], model.tok.pad_token_id, torch.long, model.device)
+    resp_attn = pad_to([[1]*len(g["resp_tokens"]) for g in group], 0, torch.long, model.device).float()
+    plan_logp_old = pad_to([g["plan_logp_old"] for g in group], 0.0, torch.float, model.device)
+    resp_logp_old = pad_to([g["resp_logp_old"] for g in group], 0.0, torch.float, model.device)
+    rewards = torch.tensor([g["reward"] for g in group], dtype=torch.float, device=model.device)
+    lengths = torch.tensor([g.get("resp_len", len(g["resp_tokens"])) for g in group],
+                           dtype=torch.float, device=model.device)
+    return (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
+            plan_logp_old, resp_logp_old, rewards, lengths)
+
+
+@torch.no_grad()
+def adapter_l2(model):
+    return float(torch.sqrt(sum((p.detach()**2).sum()
+                 for n, p in model.backbone.named_parameters() if "lora_" in n)))
+
+
+@torch.no_grad()
+def held_reward(model, held_rows, max_resp, temp=0.7):
+    """Generate (sampled, with a sampled plan) on a held set and score -> shows RL moving."""
+    if not held_rows:
+        return None
+    model.eval()
+    corr = 0
+    for r in held_rows:
+        p_ids, p_attn = model.batch_prompts([r["instruction"]])
+        plan = model.sample_plan(p_ids, p_attn, temp=temp, sample=True)
+        gen = model.generate_answer(p_ids, p_attn, plan, temp=temp, sample=True,
+                                    max_new_tokens=max_resp)
+        ans = model.tok.decode(gen[0], skip_special_tokens=True)
+        corr += graded_reward_for_row(r, ans)
+    model.train()
+    return corr / len(held_rows)
+
+
+@torch.no_grad()
+def logp_mismatch_t0(model, group):
+    """A6: BEFORE any update, the trainer-recomputed logp must match the saved logp_old (same
+    numerical path). If this isn't ~0 the importance ratio is corrupted at step 0 and no clipping
+    saves it. Returns mean |logp_train - logp_saved| over masked plan+resp tokens."""
+    (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
+     plan_logp_old, resp_logp_old, _, _) = build_group_tensors(model, group)
+    plan_new, pmask = model.plan_logp_tf(p_ids, p_attn, plan_ids, temp=1.0)
+    resp_new, rmask = model.resp_logp_tf(p_ids, p_attn, plan_ids, resp_ids, resp_attn, temp=1.0)
+    dp = ((plan_new - plan_logp_old).abs() * pmask).sum() / pmask.sum().clamp_min(1)
+    dr = ((resp_new - resp_logp_old).abs() * rmask).sum() / rmask.sum().clamp_min(1)
+    return float((dp + dr) / 2)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--rollouts", default="rl_rollouts.jsonl")
+    ap.add_argument("--sft_ckpt", default="joint_ckpt")
+    ap.add_argument("--base", default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--data", default="dataset/sft_100.jsonl", help="for CE anchor gold + held eval")
+    ap.add_argument("--out", default="rl_ckpt")
+    ap.add_argument("--inner_epochs", type=int, default=3)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--clip_eps", type=float, default=0.2)
+    ap.add_argument("--beta_plan", type=float, default=1.0)
+    ap.add_argument("--beta_ce", type=float, default=0.1)
+    ap.add_argument("--max_resp", type=int, default=64)
+    ap.add_argument("--kl_stop", type=float, default=0.15, help="cut inner epochs if approx_kl exceeds this")
+    ap.add_argument("--held", type=int, default=16, help="held instructions for held_reward (0=skip)")
+    # A1/A1b MaxEnt weighting
+    ap.add_argument("--maxent", action="store_true", default=True,
+                    help="A1/A1b: weight prompts by signal carried (replaces zero-var deletion)")
+    ap.add_argument("--no-maxent", dest="maxent", action="store_false")
+    ap.add_argument("--gamma", type=float, default=2.0, help="A1 MGPO bell width; gamma=1/(2*delta^2)")
+    ap.add_argument("--std_ref", type=float, default=0.5, help="A1b variance-weight normalizer")
+    # A2 / routing
+    ap.add_argument("--filter", action="store_true", default=True, help="A2: drop keep=False groups")
+    ap.add_argument("--no-filter", dest="filter", action="store_false")
+    ap.add_argument("--exclude_rubric", action="store_true", help="hold soft (rubric) families out of RL")
+    # A5 long2short
+    ap.add_argument("--long2short", action="store_true", help="A5: brevity reward shaping among correct")
+    ap.add_argument("--l2s_lam", type=float, default=0.2)
+    ap.add_argument("--mismatch_tol", type=float, default=1e-3, help="A6 logp_mismatch_t0 tolerance")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--seed", type=int, default=20260616)
+    args = ap.parse_args()
+    torch.manual_seed(args.seed)
+
+    # --- load SFT model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard) ---
+    model = JointModel.from_checkpoint(args.base, args.sft_ckpt, device=args.device,
+                                       is_trainable=True)
+    n_bb = model.n_trainable_backbone()
+    assert n_bb > 0, "FROZEN-BACKBONE BUG: 0 trainable backbone tensors -> RL is a no-op."
+    print(f"[grpo] >0 trainable backbone tensors: {n_bb} (≈336 expected) -- RL will actually move.")
+
+    groups = load_groups(args.rollouts, use_filter=args.filter, exclude_rubric=args.exclude_rubric)
+    assert groups, "no groups left after filtering — loosen --no-filter or regenerate hotter rollouts"
+
+    # gold plans/answers for the CE anchor + held set
+    data = {r["id"]: r for r in (json.loads(l) for l in open(args.data))}
+    train_ids = {g[0]["id"] for g in groups}
+    held_rows = [r for rid, r in data.items() if rid not in train_ids][:args.held]
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=args.lr)
+
+    l2_start = adapter_l2(model)
+    plan_dist_before = Counter(p for g in groups for rec in g for p in rec["plan_str"])
+
+    rollout_mean_reward = sum(rec["reward"] for g in groups for rec in g) / max(
+        1, sum(len(g) for g in groups))
+    print(f"[grpo] rollout mean reward (static) = {rollout_mean_reward:.3f}")
+
+    # A6: validate the offline importance ratio is sane at step 0 (BEFORE any update).
+    mm = logp_mismatch_t0(model, groups[0])
+    print(f"[grpo] logp_mismatch_t0 = {mm:.3e} (must be ~0; tol={args.mismatch_tol:g})")
+    if mm > args.mismatch_tol:
+        print("[grpo] WARNING: logp_mismatch_t0 exceeds tol — saved logp_old was recorded with a "
+              "DIFFERENT numerical path than training. Re-record logp_old via the HF teacher-forced "
+              "forward (rollout_offline already does this). The IS ratio is invalid until this is ~0.")
+
+    if args.held:
+        print(f"[grpo] held_reward(before RL) = {held_reward(model, held_rows, args.max_resp):.3f}")
+
+    # A1b: per-prompt p_q histogram (logged each inner epoch so the operator sees the bell working)
+    def pq_hist(vals):
+        bins = [0, 0, 0, 0, 0]  # [0,.2),[.2,.4),[.4,.6),[.6,.8),[.8,1]
+        for v in vals:
+            bins[min(int(v * 5), 4)] += 1
+        return bins
+
+    for ie in range(args.inner_epochs):
+        model.train(); t0 = time.time()
+        agg = {"total_loss": 0.0, "l_exec": 0.0, "exec_approx_kl": 0.0, "exec_clip_frac": 0.0,
+               "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "n": 0}
+        w_by_path = {"verifiable": [], "rubric": [], "judge": []}
+        std_by_path = {"verifiable": [], "rubric": [], "judge": []}
+        pqs = []
+        for group in groups:
+            (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
+             plan_logp_old, resp_logp_old, rewards, lengths) = build_group_tensors(model, group)
+            G = len(group)
+            path = group[0].get("reward_path", "verifiable")
+
+            # A5: brevity reward shaping among CORRECT trajectories, BEFORE advantages (zero-sum).
+            if args.long2short:
+                rewards = long2short_shape(rewards, lengths, G, lam=args.l2s_lam)
+
+            # A1/A1b: prompt weight = how much signal the group carries. verifiable -> MGPO bell on
+            # group accuracy; rubric/judge -> direct reward-spread (variance) weight.
+            pq = group_pq(rewards, G)
+            if args.maxent:
+                if path == "verifiable":
+                    adv_weights = mgpo_weight(pq, gamma=args.gamma)
+                else:
+                    adv_weights = variance_weight(rewards, G, std_ref=args.std_ref)
+            else:
+                adv_weights = None
+            pqs.append(float(pq[0]))
+            if adv_weights is not None:
+                w_by_path[path].append(float(adv_weights.mean()))
+            std_by_path[path].append(float(rewards.view(-1, G).std(unbiased=False).mean()))
+
+            # current-policy logprobs for the SAME saved tokens (temp=1 -> the policy)
+            plan_logp_new, plan_mask = model.plan_logp_tf(p_ids, p_attn, plan_ids, temp=1.0)
+            resp_logp_new, resp_mask = model.resp_logp_tf(p_ids, p_attn, plan_ids,
+                                                          resp_ids, resp_attn, temp=1.0)
+
+            # small CE anchor toward the gold plan (keeps planner from wandering off-vocab)
+            gold = data[group[0]["id"]]
+            gold_plan = encode_plan(gold["plan"], model.plan_max_len).unsqueeze(0).to(model.device)
+            gp_logits = model.planner_logits_tf(p_ids[:1], p_attn[:1], gold_plan)
+            gp_mask = (gold_plan != PAD_ID)
+            ce_plan = (F.cross_entropy(gp_logits.reshape(-1, gp_logits.size(-1)),
+                                       gold_plan.reshape(-1), reduction="none").reshape(gold_plan.shape)
+                       * gp_mask).sum() / gp_mask.sum().clamp_min(1)
+
+            loss, logs = joint_grpo_loss(
+                rewards=rewards, group_size=G,
+                exec_logp_new=resp_logp_new, exec_logp_old=resp_logp_old, exec_mask=resp_mask,
+                plan_logp_new=plan_logp_new, plan_logp_old=plan_logp_old, plan_mask=plan_mask,
+                beta_plan=args.beta_plan, clip_eps=args.clip_eps,
+                ce_plan=ce_plan, beta_ce=args.beta_ce, adv_weights=adv_weights)
+
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            for k in ("total_loss", "l_exec", "exec_approx_kl", "exec_clip_frac",
+                      "plan_approx_kl", "zero_var_frac"):
+                agg[k] += logs.get(k, 0.0)
+            agg["n"] += 1
+
+        n = max(agg["n"], 1)
+        hr = held_reward(model, held_rows, args.max_resp) if args.held else None
+        ekl = agg["exec_approx_kl"]/n
+        wv = sum(w_by_path["verifiable"])/max(1, len(w_by_path["verifiable"]))
+        wr = sum(w_by_path["rubric"])/max(1, len(w_by_path["rubric"]))
+        print(f"[grpo] inner_epoch {ie+1}/{args.inner_epochs} ({time.time()-t0:.1f}s) "
+              f"loss={agg['total_loss']/n:.4f} l_exec={agg['l_exec']/n:.4f} "
+              f"exec_approx_kl={ekl:.4f} exec_clip_frac={agg['exec_clip_frac']/n:.3f} "
+              f"plan_approx_kl={agg['plan_approx_kl']/n:.4f} "
+              + (f"held_reward={hr:.3f} " if hr is not None else "")
+              + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
+              f"p_q_hist[0-1]={pq_hist(pqs)}")
+        if ekl > args.kl_stop:
+            print(f"[grpo] approx_kl {ekl:.3f} > kl_stop {args.kl_stop}: rollouts are stale. "
+                  "Stopping inner epochs; REGENERATE rollouts before continuing.")
+            break
+
+    model.save(args.out, args.base)
+    l2_end = adapter_l2(model)
+    print(f"[grpo] saved -> {args.out}")
+    print(f"[grpo] adapter L2: start={l2_start:.4f} end={l2_end:.4f} "
+          f"|Δ|={abs(l2_end-l2_start):.4f}  (must be > 0 to prove RL ≠ SFT)")
+    print("[grpo] plan-token distribution (rollout/before):",
+          dict(plan_dist_before.most_common(8)))
+    print("[grpo] ACCEPTANCE: zero_var_frac LOW; held_reward MOVED across inner epochs; |ΔL2|>0.")
+
+
+if __name__ == "__main__":
+    main()

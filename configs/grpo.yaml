@@ -1,0 +1,15 @@
+# Stage 2b offline GRPO defaults (mirror train_grpo_offline.py CLI flags).
+rollouts: rl_rollouts.jsonl
+sft_ckpt: joint_ckpt
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/sft_100.jsonl   # gold for CE anchor + held_reward eval
+out: rl_ckpt
+inner_epochs: 3    # reuse each rollout 2-3 passes, THEN regenerate (rollouts go stale)
+lr: 1.0e-4
+clip_eps: 0.2      # PPO clip on the importance ratio
+beta_plan: 1.0     # weight on the (separate) planner clipped objective
+beta_ce: 0.1       # small CE anchor only — do NOT pin back to SFT
+max_resp: 64
+kl_stop: 0.15      # cut inner epochs if exec_approx_kl exceeds this (staleness guard)
+held: 16           # held instructions for held_reward (0 to skip)
+device: cuda
