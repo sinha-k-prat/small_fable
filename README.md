@@ -1,6 +1,12 @@
 # Adaptive planner-head small agent (SFT → offline GRPO)
 
-> 🎬 **[Core ideas, animated →](https://sinha-k-prat.github.io/small_fable/)** &nbsp;·&nbsp;
+<p align="center">
+  <a href="https://sinha-k-prat.github.io/small_fable/">
+    <img src="assets/showcase.gif" alt="Animated showcase of the core ideas — click to explore the interactive version" width="760">
+  </a>
+</p>
+
+> 🎬 **[Core ideas, animated (interactive) →](https://sinha-k-prat.github.io/small_fable/)** &nbsp;·&nbsp;
 > ▶️ **[Run the full pipeline on Colab (GPU) →](https://colab.research.google.com/github/sinha-k-prat/small_fable/blob/main/train_all_colab.ipynb)**
 
 A small model trained to behave like an **adaptive agent that switches mode from response to
