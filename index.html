@@ -6,10 +6,11 @@
 <title>Core Ideas · small_fable</title>
 
 <!-- React + ReactDOM (UMD) + Babel standalone for in-browser JSX, and Anime.js for animation.
-     All from CDN, so this file works by double-click (file://) and on GitHub Pages. -->
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+     All from CDN (pinned versions on cdnjs), so this file works by double-click (file://)
+     and on GitHub Pages. -->
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.4/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/animejs/3.2.1/anime.min.js"></script>
 
 <style>
@@ -99,6 +100,35 @@
 </head>
 <body>
 <div id="root" aria-live="polite"></div>
+
+<!-- Diagnostics: never fail silently. If the app doesn't mount, say why on the page. -->
+<script>
+  function __diag(html) {
+    var r = document.getElementById("root");
+    if (r && !r.children.length) {
+      r.innerHTML = '<pre style="color:#ff6b8b;font:13px/1.6 ui-monospace,Menlo,monospace;'
+        + 'padding:32px;white-space:pre-wrap;max-width:820px;margin:48px auto">' + html + '</pre>';
+    }
+  }
+  window.addEventListener("error", function (e) {
+    __diag("⚠ Render error\n\n" + (e.message || e) + "\n" + (e.filename || "") + " : " + (e.lineno || "")
+      + "\n\nOpen the console (View → Developer → JavaScript Console) and paste it back.");
+  });
+  // After scripts have had time to load, report any missing library.
+  window.addEventListener("load", function () {
+    setTimeout(function () {
+      var miss = [];
+      if (typeof React === "undefined") miss.push("React");
+      if (typeof ReactDOM === "undefined") miss.push("ReactDOM");
+      if (typeof Babel === "undefined") miss.push("Babel (JSX compiler)");
+      if (typeof anime === "undefined") miss.push("anime.js");
+      if (miss.length) __diag("⚠ These libraries failed to load from the CDN:\n  " + miss.join(", ")
+        + "\n\nLikely a network/CDN block or no internet. Try another network, then reload.");
+      else __diag("⚠ Libraries loaded but the app did not mount — likely a JSX compile error.\n"
+        + "Open the browser console for the Babel message and paste it back.");
+    }, 2000);
+  });
+</script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useRef, useEffect, useCallback } = React;
