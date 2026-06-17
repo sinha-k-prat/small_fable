@@ -20,39 +20,32 @@ import argparse, json, re
 
 TURN_RE = re.compile(r'^\s*TURN\s+\d+\s*\[(.*)\]\s*$')
 DROP_PARAMS = {'confidence'}   # noise — not part of the strategy
-
-def canon_prim(p):
-    """Canonicalize a primitive KEEPING its strategy parameters: 'REFLECT[aspect=step,
-    reason=naive_vs_correct]'. Drops 'confidence', removes spaces, sorts params for a stable token.
-    These parameters (as=, reason=, prop=, form=, ...) are the load-bearing mode signal."""
-    p = p.strip()
-    name = p.split('[')[0].strip()
-    m = re.search(r'\[(.*)\]', p)
-    if not m:
-        return name
-    params = []
-    for kv in m.group(1).split(','):
-        kv = kv.strip().replace(' ', '')
-        if not kv:
-            continue
-        if kv.split('=')[0] in DROP_PARAMS:
-            continue
-        params.append(kv)
-    params.sort()
-    return f"{name}[{','.join(params)}]" if params else name
+END = 'END'                    # explicit plan terminator (the last FINALIZE param is real content)
 
 def parse_plan(trace):
-    """Primitives from each TURN bracket, KEEPING canonicalized parameters, in order."""
-    plan = []
+    """FACTORED plan: a flat sequence of sub-tokens — each primitive followed by its parameter atoms
+    (key=value), ending with END. So a single autoregressive head composes primitives with params,
+    and a novel primitive+param pairing is just a novel sequence of already-seen tokens.
+      MODEL as=truth_table LINK guard=on VERIFY aspect=logic FINALIZE form=yes_no END
+    """
+    seq = []
     for line in trace.splitlines():
         m = TURN_RE.match(line)
         if not m:
             continue
         for prim in m.group(1).split(';'):
             prim = prim.strip()
-            if prim:
-                plan.append(canon_prim(prim))
-    return plan
+            if not prim:
+                continue
+            seq.append(prim.split('[')[0].strip())            # the primitive
+            pm = re.search(r'\[(.*)\]', prim)
+            if pm:
+                for kv in pm.group(1).split(','):              # its parameter atoms
+                    kv = kv.strip().replace(' ', '')
+                    if kv and kv.split('=')[0] not in DROP_PARAMS:
+                        seq.append(kv)
+    seq.append(END)
+    return seq
 
 def parse_answer(trace):
     """Executor target = the reasoning prose (all `response:` lines joined)."""
@@ -138,11 +131,9 @@ def main():
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
                 n += 1
     vocab = ['PAD'] + vocab_order
-    bases = {p.split('[')[0] for p in seen}
-    term = 'FINALIZE' if 'FINALIZE' in bases else vocab_order[-1].split('[')[0]   # match by base name
-    json.dump({'vocab': vocab, 'terminator': term}, open(args.vocab_out, 'w'), indent=1)
+    json.dump({'vocab': vocab, 'terminator': END}, open(args.vocab_out, 'w'), indent=1)
     print(f"wrote {n} rows -> {args.out}  (answer-key matched {matched}/{n})")
-    print(f"wrote {args.vocab_out}: {len(vocab)} primitives, terminator={term}")
+    print(f"wrote {args.vocab_out}: {len(vocab)} tokens (primitives + param-atoms), terminator={END}")
 
 if __name__ == '__main__':
     main()
