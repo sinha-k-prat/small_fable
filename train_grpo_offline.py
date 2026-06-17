@@ -186,6 +186,12 @@ def main():
     # --- load model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard).
     #     On --resume, continue from the RL checkpoint (--out); else start from the SFT checkpoint. ---
     resume_state = load_train_state(args.out) if (args.resume and os.path.isdir(args.out)) else None
+    if resume_state is not None:   # don't resume a checkpoint from a DIFFERENT data/rollouts config
+        prev = resume_state.get("args", {})
+        if prev.get("data") != args.data or prev.get("rollouts") != args.rollouts:
+            print(f"[grpo] checkpoint config differs (data={prev.get('data')}, rollouts="
+                  f"{prev.get('rollouts')}) — ignoring --resume, starting fresh from {args.sft_ckpt}.")
+            resume_state = None
     load_from = args.out if resume_state is not None else args.sft_ckpt
     if resume_state is not None:
         print(f"[grpo] RESUMING from {args.out}: inner_epoch={resume_state['inner_epoch']} "

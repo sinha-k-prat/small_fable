@@ -292,6 +292,12 @@ def main():
     if resume_state is not None and args.curriculum:
         print("[sft] WARNING: --resume is single-stage only; ignoring it for --curriculum (starts fresh).")
         resume_state = None
+    if resume_state is not None:   # don't resume a checkpoint trained on a DIFFERENT dataset/split
+        prev = resume_state.get("args", {})
+        if prev.get("data") != args.data or prev.get("train") != args.train:
+            print(f"[sft] checkpoint config differs (data={prev.get('data')} train={prev.get('train')}) "
+                  f"vs now (data={args.data} train={args.train}) — ignoring --resume, starting fresh.")
+            resume_state = None
 
     if resume_state is not None:
         print(f"[sft] RESUMING from {args.out}: epoch={resume_state['epoch']} "
@@ -311,6 +317,7 @@ def main():
         print("[sft] initial held:",
               json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
 
+    final_held = None
     if not args.curriculum:
         steps = max(1, args.epochs * math.ceil(len(train_rows)/args.bs))
         opt, sched = make_opt_sched(model, args.lr, args.lr_min, steps, args.warmup_frac)
@@ -325,8 +332,8 @@ def main():
             restore_rng(resume_state)
             s_ep, s_bi, g_step = (resume_state["epoch"], resume_state["batch_idx"],
                                   resume_state["global_step"])
-        run_stage(model, opt, sched, train_rows, args.epochs, args, "single",
-                  ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi, global_step=g_step)
+        final_held = run_stage(model, opt, sched, train_rows, args.epochs, args, "single",
+                               ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi, global_step=g_step)
     else:
         # ---- Stage 1: broad coverage ----
         s1 = max(1, args.stage1_epochs * math.ceil(len(train_rows)/args.bs))
@@ -355,8 +362,18 @@ def main():
 
     model.save(args.out, args.base)
     print(f"[sft] saved -> {args.out}")
-    print("[sft] ACCEPTANCE: held plan_ce dropped; ablation_gap POSITIVE (plan load-bearing); "
-          "with --curriculum, stage2 gap >= stage1 gap; probe distinct_plans/prompt > 1.")
+    # Report the ACTUAL ablation gap (not a hardcoded claim). Positive = plan is load-bearing.
+    gap = (final_held or {}).get("ablation_gap")
+    if gap is not None:
+        if gap > 0:
+            print(f"[sft] RESULT: held ablation_gap = {gap:+.3f}  ✓ plan is LOAD-BEARING "
+                  "(with-plan beats no-plan).")
+        else:
+            print(f"[sft] RESULT: held ablation_gap = {gap:+.3f}  ✗ plan is NOT load-bearing on this "
+                  "data (with-plan ≤ no-plan). Use a plan-sensitive corpus "
+                  "(build_sensitivity_corpus.py) — the plan must causally help the answer.")
+    print("[sft] acceptance targets: held plan_ce dropped; ablation_gap POSITIVE; "
+          "probe distinct_plans/prompt > 1" + ("; with --curriculum stage2 gap ≥ stage1." if args.curriculum else "."))
 
 
 if __name__ == "__main__":
