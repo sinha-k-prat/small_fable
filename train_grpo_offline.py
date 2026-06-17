@@ -36,7 +36,7 @@ CLI:
       --out rl_ckpt --inner_epochs 3 --lr 1e-4 --clip_eps 0.2 --beta_plan 1.0 --beta_ce 0.1 \
       --device cuda
 """
-import argparse, json, copy, time
+import argparse, json, copy, os, time
 from collections import Counter
 import torch, torch.nn.functional as F
 
@@ -44,6 +44,17 @@ from model_joint import JointModel, encode_plan, PAD_ID, decode_plan
 from grpo_offpolicy import (joint_grpo_loss, mgpo_weight, variance_weight, group_pq,
                             long2short_shape)
 from checkers import graded_reward_for_row
+from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
+                           scalar_args)
+
+
+def _grpo_state(inner_epoch, group_idx, global_step, opt, args):
+    """Resume payload: position = next (inner_epoch, group_idx) to run."""
+    import random
+    return {"kind": "grpo", "inner_epoch": inner_epoch, "group_idx": group_idx,
+            "global_step": global_step, "optimizer": opt.state_dict(),
+            "torch_rng": torch.get_rng_state(), "py_rng": random.getstate(),
+            "args": scalar_args(args)}
 
 
 def load_groups(path, use_filter=True, exclude_rubric=False):
@@ -158,13 +169,28 @@ def main():
     ap.add_argument("--long2short", action="store_true", help="A5: brevity reward shaping among correct")
     ap.add_argument("--l2s_lam", type=float, default=0.2)
     ap.add_argument("--mismatch_tol", type=float, default=1e-3, help="A6 logp_mismatch_t0 tolerance")
+    # checkpoint / resume
+    ap.add_argument("--ckpt_every_min", type=float, default=0.0,
+                    help="periodic checkpoint interval in minutes (0 = only at inner-epoch boundaries)")
+    ap.add_argument("--ckpt_every_steps", type=int, default=0,
+                    help="periodic checkpoint every N group steps (0 = off)")
+    ap.add_argument("--hf_repo", default=None,
+                    help="push each checkpoint to this HF model repo (e.g. user/small_fable-planner)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from --out if it contains a train_state.pt")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=20260616)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
 
-    # --- load SFT model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard) ---
-    model = JointModel.from_checkpoint(args.base, args.sft_ckpt, device=args.device,
+    # --- load model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard).
+    #     On --resume, continue from the RL checkpoint (--out); else start from the SFT checkpoint. ---
+    resume_state = load_train_state(args.out) if (args.resume and os.path.isdir(args.out)) else None
+    load_from = args.out if resume_state is not None else args.sft_ckpt
+    if resume_state is not None:
+        print(f"[grpo] RESUMING from {args.out}: inner_epoch={resume_state['inner_epoch']} "
+              f"group={resume_state['group_idx']} step={resume_state['global_step']}")
+    model = JointModel.from_checkpoint(args.base, load_from, device=args.device,
                                        is_trainable=True)
     n_bb = model.n_trainable_backbone()
     assert n_bb > 0, "FROZEN-BACKBONE BUG: 0 trainable backbone tensors -> RL is a no-op."
@@ -181,6 +207,16 @@ def main():
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=args.lr)
 
+    # checkpoint + resume wiring
+    ckpt = Checkpointer(args.out, args.base, every_min=args.ckpt_every_min,
+                        every_steps=args.ckpt_every_steps, hf_repo=args.hf_repo)
+    start_ie = start_gi = global_step = 0
+    if resume_state is not None:
+        restore_optimizer(opt, resume_state, model.device)
+        restore_rng(resume_state)
+        start_ie, start_gi, global_step = (resume_state["inner_epoch"], resume_state["group_idx"],
+                                           resume_state["global_step"])
+
     l2_start = adapter_l2(model)
     plan_dist_before = Counter(p for g in groups for rec in g for p in rec["plan_str"])
 
@@ -188,16 +224,17 @@ def main():
         1, sum(len(g) for g in groups))
     print(f"[grpo] rollout mean reward (static) = {rollout_mean_reward:.3f}")
 
-    # A6: validate the offline importance ratio is sane at step 0 (BEFORE any update).
-    mm = logp_mismatch_t0(model, groups[0])
-    print(f"[grpo] logp_mismatch_t0 = {mm:.3e} (must be ~0; tol={args.mismatch_tol:g})")
-    if mm > args.mismatch_tol:
-        print("[grpo] WARNING: logp_mismatch_t0 exceeds tol — saved logp_old was recorded with a "
-              "DIFFERENT numerical path than training. Re-record logp_old via the HF teacher-forced "
-              "forward (rollout_offline already does this). The IS ratio is invalid until this is ~0.")
-
-    if args.held:
-        print(f"[grpo] held_reward(before RL) = {held_reward(model, held_rows, args.max_resp):.3f}")
+    # A6: validate the offline importance ratio is sane at step 0 (BEFORE any update). Skip on resume:
+    # after some training the policy has drifted, so logp_old no longer matches by design.
+    if resume_state is None:
+        mm = logp_mismatch_t0(model, groups[0])
+        print(f"[grpo] logp_mismatch_t0 = {mm:.3e} (must be ~0; tol={args.mismatch_tol:g})")
+        if mm > args.mismatch_tol:
+            print("[grpo] WARNING: logp_mismatch_t0 exceeds tol — saved logp_old was recorded with a "
+                  "DIFFERENT numerical path than training. Re-record logp_old via the HF teacher-forced "
+                  "forward (rollout_offline already does this). The IS ratio is invalid until this is ~0.")
+        if args.held:
+            print(f"[grpo] held_reward(before RL) = {held_reward(model, held_rows, args.max_resp):.3f}")
 
     # A1b: per-prompt p_q histogram (logged each inner epoch so the operator sees the bell working)
     def pq_hist(vals):
@@ -206,14 +243,18 @@ def main():
             bins[min(int(v * 5), 4)] += 1
         return bins
 
-    for ie in range(args.inner_epochs):
+    for ie in range(start_ie, args.inner_epochs):
         model.train(); t0 = time.time()
         agg = {"total_loss": 0.0, "l_exec": 0.0, "exec_approx_kl": 0.0, "exec_clip_frac": 0.0,
                "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "n": 0}
         w_by_path = {"verifiable": [], "rubric": [], "judge": []}
         std_by_path = {"verifiable": [], "rubric": [], "judge": []}
         pqs = []
-        for group in groups:
+        sgi = start_gi if ie == start_ie else 0   # mid-inner-epoch resume only on the resumed epoch
+        for gi in range(len(groups)):
+            if gi < sgi:
+                continue
+            group = groups[gi]
             (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
              plan_logp_old, resp_logp_old, rewards, lengths) = build_group_tensors(model, group)
             G = len(group)
@@ -262,10 +303,14 @@ def main():
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
+            global_step += 1
             for k in ("total_loss", "l_exec", "exec_approx_kl", "exec_clip_frac",
                       "plan_approx_kl", "zero_var_frac"):
                 agg[k] += logs.get(k, 0.0)
             agg["n"] += 1
+            if ckpt.due(global_step):
+                ckpt.save(model, _grpo_state(ie, gi + 1, global_step, opt, args),
+                          reason=f"grpo-ie{ie+1}-g{gi+1}")
 
         n = max(agg["n"], 1)
         hr = held_reward(model, held_rows, args.max_resp) if args.held else None
@@ -279,12 +324,15 @@ def main():
               + (f"held_reward={hr:.3f} " if hr is not None else "")
               + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
               f"p_q_hist[0-1]={pq_hist(pqs)}")
+        # end-of-inner-epoch checkpoint: next position = (ie+1, 0)
+        ckpt.save(model, _grpo_state(ie + 1, 0, global_step, opt, args), reason=f"grpo-inner{ie+1}")
         if ekl > args.kl_stop:
             print(f"[grpo] approx_kl {ekl:.3f} > kl_stop {args.kl_stop}: rollouts are stale. "
                   "Stopping inner epochs; REGENERATE rollouts before continuing.")
             break
 
-    model.save(args.out, args.base)
+    # final checkpoint: position past the end (resume would be a no-op)
+    ckpt.save(model, _grpo_state(args.inner_epochs, 0, global_step, opt, args), reason="final")
     l2_end = adapter_l2(model)
     print(f"[grpo] saved -> {args.out}")
     print(f"[grpo] adapter L2: start={l2_start:.4f} end={l2_end:.4f} "

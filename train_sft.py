@@ -30,11 +30,13 @@ CLI (A3 two-stage curriculum):
   python train_sft.py --data dataset/sft_flat.jsonl --train 800 --held 100 --curriculum \
       --stage1_epochs 5 --stage2_epochs 2 --lr 5e-5 --lr_min 8e-8 --device cuda
 """
-import argparse, json, math, random, time
+import argparse, json, math, os, random, time
 import torch, torch.nn.functional as F
 
 from model_joint import JointModel, encode_plan, decode_plan, PAD_ID
 from checkers import graded_reward_for_row
+from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
+                           scalar_args)
 
 
 # --------------------------------------------------------------------------- data
@@ -169,11 +171,27 @@ def hard_subset(model, rows, samples=8, max_resp=64, temp=1.3, err_rate=0.75):
 
 
 # --------------------------------------------------------------------------- training
-def run_stage(model, opt, sched, stage_rows, epochs, args, tag):
-    for ep in range(epochs):
+def _sft_state(epoch, batch_idx, global_step, opt, sched, args):
+    """Resume payload: position = next (epoch, batch_idx) to run."""
+    return {"kind": "sft", "epoch": epoch, "batch_idx": batch_idx, "global_step": global_step,
+            "optimizer": opt.state_dict(),
+            "scheduler": (sched.state_dict() if sched is not None else None),
+            "torch_rng": torch.get_rng_state(), "py_rng": random.getstate(),
+            "args": scalar_args(args)}
+
+
+def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
+              ckpt=None, start_epoch=0, start_batch=0, global_step=0):
+    held = {"ablation_gap": 0.0}
+    for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time()
         run = {"plan_ce": 0.0, "resp_ce": 0.0, "kl": 0.0, "n": 0}
-        for batch in curriculum_batches(stage_rows, args.bs, seed=args.seed + ep):
+        batches = list(curriculum_batches(stage_rows, args.bs, seed=args.seed + ep))
+        sb = start_batch if ep == start_epoch else 0   # mid-epoch resume only on the resumed epoch
+        for bi in range(len(batches)):
+            if bi < sb:
+                continue
+            batch = batches[bi]
             instrs = [r["instruction"] for r in batch]
             p_ids, p_attn = model.batch_prompts(instrs)
             plan_ids = torch.stack([encode_plan(r["plan"], model.plan_max_len) for r in batch]).to(model.device)
@@ -186,13 +204,20 @@ def run_stage(model, opt, sched, stage_rows, epochs, args, tag):
             opt.step()
             if sched is not None:
                 sched.step()
+            global_step += 1
             run["plan_ce"] += float(l_plan); run["resp_ce"] += float(l_resp)
             run["kl"] += float(l_kl); run["n"] += 1
+            if ckpt is not None and ckpt.due(global_step):
+                ckpt.save(model, _sft_state(ep, bi + 1, global_step, opt, sched, args),
+                          reason=f"{tag}-e{ep+1}-b{bi+1}")
         n = max(run["n"], 1)
         held = eval_held(model, args._held_rows, args.max_resp, sample=args.eval_sample)
         print(f"[sft:{tag}] epoch {ep+1}/{epochs} ({time.time()-t0:.1f}s) "
               f"plan_ce={run['plan_ce']/n:.4f} resp_ce={run['resp_ce']/n:.4f} kl={run['kl']/n:.4f} "
               f"| held {json.dumps(held)}")
+        if ckpt is not None:   # end-of-epoch checkpoint: next position = (ep+1, 0)
+            ckpt.save(model, _sft_state(ep + 1, 0, global_step, opt, sched, args),
+                      reason=f"{tag}-epoch{ep+1}")
     return held or {"ablation_gap": 0.0}
 
 
@@ -242,6 +267,15 @@ def main():
     ap.add_argument("--stage1_out", default=None, help="optional path to save the stage-1 checkpoint")
     # A4 probe
     ap.add_argument("--probe", type=int, default=16, help="probe set size for diversity/Pass@k (0=skip)")
+    # checkpoint / resume (single-stage only)
+    ap.add_argument("--ckpt_every_min", type=float, default=0.0,
+                    help="periodic checkpoint interval in minutes (0 = only at epoch boundaries)")
+    ap.add_argument("--ckpt_every_steps", type=int, default=0,
+                    help="periodic checkpoint every N optimizer steps (0 = off)")
+    ap.add_argument("--hf_repo", default=None,
+                    help="push each checkpoint to this HF model repo (e.g. user/small_fable-planner)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from --out if it contains a train_state.pt (single-stage only)")
     args = ap.parse_args()
     random.seed(args.seed); torch.manual_seed(args.seed)
 
@@ -253,14 +287,40 @@ def main():
     args._held_rows = held_rows
     print(f"[sft] data={args.data} train={len(train_rows)} (expanded) held={len(held_rows)} base={args.base}")
 
-    model = JointModel.from_base(args.base, device=args.device, plan_max_len=args.plan_max_len)
+    # ---- resume? (single-stage only) ----
+    resume_state = load_train_state(args.out) if (args.resume and os.path.isdir(args.out)) else None
+    if resume_state is not None and args.curriculum:
+        print("[sft] WARNING: --resume is single-stage only; ignoring it for --curriculum (starts fresh).")
+        resume_state = None
+
+    if resume_state is not None:
+        print(f"[sft] RESUMING from {args.out}: epoch={resume_state['epoch']} "
+              f"batch={resume_state['batch_idx']} step={resume_state['global_step']}")
+        model = JointModel.from_checkpoint(args.base, args.out, device=args.device,
+                                           is_trainable=True, plan_max_len=args.plan_max_len)
+    else:
+        model = JointModel.from_base(args.base, device=args.device, plan_max_len=args.plan_max_len)
     print(f"[sft] trainable backbone (LoRA) tensors: {model.n_trainable_backbone()}")
-    print("[sft] initial held:", json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
+    if resume_state is None:
+        print("[sft] initial held:",
+              json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
 
     if not args.curriculum:
         steps = max(1, args.epochs * math.ceil(len(train_rows)/args.bs))
         opt, sched = make_opt_sched(model, args.lr, args.lr_min, steps, args.warmup_frac)
-        run_stage(model, opt, sched, train_rows, args.epochs, args, "single")
+        ckpt = Checkpointer(args.out, args.base, every_min=args.ckpt_every_min,
+                            every_steps=args.ckpt_every_steps, hf_repo=args.hf_repo)
+        s_ep = s_bi = g_step = 0
+        if resume_state is not None:
+            restore_optimizer(opt, resume_state, model.device)
+            if sched is not None and resume_state.get("scheduler") is not None:
+                try: sched.load_state_dict(resume_state["scheduler"])
+                except Exception as e: print("[sft] scheduler restore skipped:", e)
+            restore_rng(resume_state)
+            s_ep, s_bi, g_step = (resume_state["epoch"], resume_state["batch_idx"],
+                                  resume_state["global_step"])
+        run_stage(model, opt, sched, train_rows, args.epochs, args, "single",
+                  ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi, global_step=g_step)
     else:
         # ---- Stage 1: broad coverage ----
         s1 = max(1, args.stage1_epochs * math.ceil(len(train_rows)/args.bs))
