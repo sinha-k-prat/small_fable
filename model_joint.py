@@ -36,16 +36,27 @@ LORA_TARGETS = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_
 
 # Plan primitive vocabulary. Parameterized ops (FILTER[even], TOP_K[k=3]) collapse to their
 # base primitive via split("[") so the planner head stays a fixed, separate action space.
-PLAN_VOCAB = ["PAD","EXTRACT","DECOMPOSE","MODEL","IDENTIFY_UNKNOWN","ORDER","FIND",
+_DEFAULT_PLAN_VOCAB = ["PAD","EXTRACT","DECOMPOSE","MODEL","IDENTIFY_UNKNOWN","ORDER","FIND",
     "GENERATE","GENERATE_ALT","EXPLORE","DIVERGE","LINK","SIMULATE","TRACE","CALCULATE",
     "PREDICT","COMPARE","WEIGH","VERIFY_LOGIC","VERIFY_CONSTRAINTS","VERIFY_COMPLETENESS",
     "VERIFY_CONSISTENCY","VERIFY_STEP","VERIFY_EVIDENCE","REFLECT","EVAL","REFINE","CORRECT",
     "REPAIR","EXPAND","SIMPLIFY","MERGE","COMBINE","GENERALIZE","RESOLVE_CONFLICT","PLAN",
     "PLAN_NEXT","SELECT","CLARIFY","ADAPT","TERMINATE"]
+
+# A run can override the planner's action space + terminator via plan_vocab.json (written by
+# traces_to_sft.py). MUST be the same file at train and inference time (the planner head is sized to
+# it). Absent -> the default vocab above, so existing tests/synthetic data are unaffected.
+_VOCAB_FILE = os.environ.get("PLAN_VOCAB_FILE",
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan_vocab.json"))
+if os.path.exists(_VOCAB_FILE):
+    _vc = json.load(open(_VOCAB_FILE))
+    PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", "TERMINATE")
+else:
+    PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = "TERMINATE"
 PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
 ID2PLAN = {i:p for p,i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
-TERM_ID = PLAN2ID["TERMINATE"]
+TERM_ID = PLAN2ID.get(_TERM_NAME, len(PLAN_VOCAB) - 1)
 N_PLAN  = len(PLAN_VOCAB)
 
 
