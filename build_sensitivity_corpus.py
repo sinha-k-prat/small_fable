@@ -186,54 +186,68 @@ def main():
     ap.add_argument("--out", default="dataset/plan_dataset_sensitive.jsonl")
     ap.add_argument("--report", default="dataset/sensitivity_report.csv")
     ap.add_argument("--seed", type=int, default=20260616)
+    ap.add_argument("--max_new", type=int, default=64, help="answer is just the final token; keep short for speed")
+    ap.add_argument("--progress_every", type=int, default=25, help="print progress + ETA every N candidates")
+    ap.add_argument("--resume", action="store_true", help="continue an interrupted build (within the same runtime)")
     args=ap.parse_args()
 
+    import os, time
     rng=random.Random(args.seed)
-    scorer = MockScorer(args.seed) if args.mock else HFScorer(args.base, args.device, temp=args.temp)
+    scorer = MockScorer(args.seed) if args.mock else HFScorer(
+        args.base, args.device, max_new=args.max_new, temp=args.temp)
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    prog_file = args.out + ".progress"
 
-    kept=[]; rows_report=[]; fam_keep=Counter(); fam_seen=Counter()
-    for i in range(args.n_candidates):
+    # RESUME (within a runtime): replay the RNG to the saved index, append to the existing file.
+    start, fmode, kept_n = 0, "w", 0
+    if args.resume and os.path.exists(args.out) and os.path.exists(prog_file):
+        start = int((open(prog_file).read().strip() or "0"))
+        kept_n = sum(1 for _ in open(args.out))
+        for i in range(start):
+            FAMILIES[i % len(FAMILIES)](rng)        # advance RNG (task-gen is cheap, no model)
+        fmode = "a"
+        print(f"[build] RESUMING at candidate {start}/{args.n_candidates} (kept so far: {kept_n})", flush=True)
+
+    rows_report=[]; fam_keep=Counter()
+    fout = open(args.out, fmode)
+    t0 = time.time()
+    for i in range(start, args.n_candidates):
         task=FAMILIES[i%len(FAMILIES)](rng)
-        fam_seen[task["family"]]+=1
         q_plan = scorer.correctness(task, with_plan=True,  n=args.samples)
         q_naive= scorer.correctness(task, with_plan=False, n=args.samples)
         sens   = round(q_plan - q_naive, 3)
         keep = (sens>=args.tau and q_naive<=args.naive_ceil and q_plan>=args.plan_floor)
         rows_report.append((task["family"], q_plan, q_naive, sens, int(keep)))
         if keep:
-            fam_keep[task["family"]]+=1
-            kept.append({
-                "id": f"task_{i:05d}",
-                "family": task["family"],
-                "prompt": task["prompt"],
+            fam_keep[task["family"]]+=1; kept_n+=1
+            fout.write(json.dumps({
+                "id": f"task_{i:05d}", "family": task["family"], "prompt": task["prompt"],
                 "plan": task["gold_plan"],            # gold op-pipeline (planner-head target)
                 "answer": task["gold_answer"],        # checkable gold
-                "checker_kind": task["checker_kind"],
-                "checker_args": task["checker_args"],
-                "sensitivity": sens,
-                "q_plan": round(q_plan,3),
-                "q_naive": round(q_naive,3),
-            })
+                "checker_kind": task["checker_kind"], "checker_args": task["checker_args"],
+                "sensitivity": sens, "q_plan": round(q_plan,3), "q_naive": round(q_naive,3),
+            }, ensure_ascii=False)+"\n")
+            fout.flush()                              # incremental: a crash never loses kept rows
+        if (i+1) % args.progress_every == 0 or (i+1)==args.n_candidates:
+            done=i+1-start; rate=done/max(1e-9, time.time()-t0); eta=(args.n_candidates-(i+1))/max(1e-9, rate)
+            open(prog_file,"w").write(str(i+1))       # resume marker
+            print(f"[build] {i+1}/{args.n_candidates}  kept={kept_n}  "
+                  f"({rate:.1f} cand/s, ETA {eta/60:.0f} min)", flush=True)
+    fout.close()
 
-    import os
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out,"w") as f:
-        for row in kept: f.write(json.dumps(row,ensure_ascii=False)+"\n")
-    with open(args.report,"w") as f:
+    with open(args.report,"w") as f:                  # this session's audit rows (partial after resume)
         f.write("family,q_plan,q_naive,sensitivity,kept\n")
         for fa,qp,qn,se,k in rows_report:
             f.write(f"{fa},{qp:.3f},{qn:.3f},{se:.3f},{k}\n")
-
-    sens_all=[r[3] for r in rows_report]
-    sens_kept=[r[3] for r in rows_report if r[4]]
-    print(f"candidates: {args.n_candidates} | kept: {len(kept)} ({len(kept)/args.n_candidates*100:.1f}%)")
-    print(f"sensitivity all:  mean {st.mean(sens_all):+.3f}")
-    if sens_kept: print(f"sensitivity kept: mean {st.mean(sens_kept):+.3f}  min {min(sens_kept):+.3f}")
-    print("kept by family:", dict(fam_keep))
+    sens_all=[r[3] for r in rows_report]; sens_kept=[r[3] for r in rows_report if r[4]]
+    print(f"candidates: {args.n_candidates} | total kept in {args.out}: {kept_n}")
+    if sens_all:  print(f"sensitivity (this session) mean {st.mean(sens_all):+.3f}")
+    if sens_kept: print(f"kept sensitivity mean {st.mean(sens_kept):+.3f}  min {min(sens_kept):+.3f}")
+    print("kept by family (this session):", dict(fam_keep))
+    if os.path.exists(prog_file): os.remove(prog_file)   # completed run leaves no progress marker
     print(f"wrote {args.out} and {args.report}")
     print("\nNOTE: kept tasks have P(correct|plan) >> P(correct|naive) BY CONSTRUCTION,")
-    print("so SFT has headroom and GRPO groups will have reward variance. This is the")
-    print("real-task analog of the A/B headroom guarantee from the synthetic set.")
+    print("so SFT has headroom and GRPO groups will have reward variance.")
 
 if __name__=="__main__":
     main()
