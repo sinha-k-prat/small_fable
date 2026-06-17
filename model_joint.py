@@ -56,7 +56,11 @@ else:
 PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
 ID2PLAN = {i:p for p,i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
-TERM_ID = PLAN2ID.get(_TERM_NAME, len(PLAN_VOCAB) - 1)
+# Terminator is matched by BASE name, so every parameterized variant (e.g. FINALIZE[form=yes_no],
+# FINALIZE[form=number_with_units]) ends a plan. TERM_ID keeps a single representative for legacy use.
+_TERM_BASE = _TERM_NAME.split("[")[0]
+TERM_IDS = {i for p, i in PLAN2ID.items() if p.split("[")[0] == _TERM_BASE}
+TERM_ID = min(TERM_IDS) if TERM_IDS else len(PLAN_VOCAB) - 1
 N_PLAN  = len(PLAN_VOCAB)
 
 
@@ -116,8 +120,10 @@ class PlanEmbedding(nn.Module):
 
 
 def encode_plan(plan_list, max_len=12):
-    """Gold plan (list of primitive strings, possibly parameterized) -> padded id tensor (max_len,)."""
-    ids = [PLAN2ID.get(p.split("[")[0], PAD_ID) for p in plan_list][:max_len]
+    """Gold plan (list of primitive strings) -> padded id tensor (max_len,). Looks up the FULL
+    (parameterized) token first so 'REFLECT[reason=naive_vs_correct]' keeps its strategy; falls back
+    to the bare base name (so unparameterized/synthetic plans still resolve)."""
+    ids = [PLAN2ID.get(p, PLAN2ID.get(p.split("[")[0], PAD_ID)) for p in plan_list][:max_len]
     ids += [PAD_ID] * (max_len - len(ids))
     return torch.tensor(ids, dtype=torch.long)
 
@@ -284,7 +290,8 @@ class JointModel(nn.Module):
                 nxt = logits.argmax(-1)
             nxt = torch.where(done, torch.full_like(nxt, PAD_ID), nxt)
             plan[:, t] = nxt
-            done = done | (nxt == TERM_ID)
+            is_term = sum((nxt == tid) for tid in TERM_IDS) > 0   # any FINALIZE[...] variant ends the plan
+            done = done | is_term
             if done.all():
                 break
             step_emb = self.plan_emb(nxt.clamp_min(0)).unsqueeze(1)     # (B,1,H)

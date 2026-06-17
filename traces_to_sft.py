@@ -19,18 +19,39 @@ CLI:
 import argparse, json, re
 
 TURN_RE = re.compile(r'^\s*TURN\s+\d+\s*\[(.*)\]\s*$')
+DROP_PARAMS = {'confidence'}   # noise — not part of the strategy
+
+def canon_prim(p):
+    """Canonicalize a primitive KEEPING its strategy parameters: 'REFLECT[aspect=step,
+    reason=naive_vs_correct]'. Drops 'confidence', removes spaces, sorts params for a stable token.
+    These parameters (as=, reason=, prop=, form=, ...) are the load-bearing mode signal."""
+    p = p.strip()
+    name = p.split('[')[0].strip()
+    m = re.search(r'\[(.*)\]', p)
+    if not m:
+        return name
+    params = []
+    for kv in m.group(1).split(','):
+        kv = kv.strip().replace(' ', '')
+        if not kv:
+            continue
+        if kv.split('=')[0] in DROP_PARAMS:
+            continue
+        params.append(kv)
+    params.sort()
+    return f"{name}[{','.join(params)}]" if params else name
 
 def parse_plan(trace):
-    """Primitives from each TURN bracket, base name (strip [params]), in order."""
+    """Primitives from each TURN bracket, KEEPING canonicalized parameters, in order."""
     plan = []
     for line in trace.splitlines():
         m = TURN_RE.match(line)
         if not m:
             continue
         for prim in m.group(1).split(';'):
-            name = prim.strip().split('[')[0].strip()
-            if name:
-                plan.append(name)
+            prim = prim.strip()
+            if prim:
+                plan.append(canon_prim(prim))
     return plan
 
 def parse_answer(trace):
@@ -117,7 +138,8 @@ def main():
                 f.write(json.dumps(rec, ensure_ascii=False) + '\n')
                 n += 1
     vocab = ['PAD'] + vocab_order
-    term = 'FINALIZE' if 'FINALIZE' in seen else vocab_order[-1]
+    bases = {p.split('[')[0] for p in seen}
+    term = 'FINALIZE' if 'FINALIZE' in bases else vocab_order[-1].split('[')[0]   # match by base name
     json.dump({'vocab': vocab, 'terminator': term}, open(args.vocab_out, 'w'), indent=1)
     print(f"wrote {n} rows -> {args.out}  (answer-key matched {matched}/{n})")
     print(f"wrote {args.vocab_out}: {len(vocab)} primitives, terminator={term}")

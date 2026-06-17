@@ -40,7 +40,7 @@ import argparse, json, copy, os, time
 from collections import Counter
 import torch, torch.nn.functional as F
 
-from model_joint import JointModel, encode_plan, PAD_ID, decode_plan
+from model_joint import JointModel, encode_plan, PAD_ID, decode_plan, N_PLAN
 from grpo_offpolicy import (joint_grpo_loss, mgpo_weight, variance_weight, group_pq,
                             long2short_shape)
 from checkers import graded_reward_for_row
@@ -52,7 +52,7 @@ def _grpo_state(inner_epoch, group_idx, global_step, opt, args):
     """Resume payload: position = next (inner_epoch, group_idx) to run."""
     import random
     return {"kind": "grpo", "inner_epoch": inner_epoch, "group_idx": group_idx,
-            "global_step": global_step, "optimizer": opt.state_dict(),
+            "global_step": global_step, "n_plan": N_PLAN, "optimizer": opt.state_dict(),
             "torch_rng": torch.get_rng_state(), "py_rng": random.getstate(),
             "args": scalar_args(args)}
 
@@ -186,11 +186,13 @@ def main():
     # --- load model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard).
     #     On --resume, continue from the RL checkpoint (--out); else start from the SFT checkpoint. ---
     resume_state = load_train_state(args.out) if (args.resume and os.path.isdir(args.out)) else None
-    if resume_state is not None:   # don't resume a checkpoint from a DIFFERENT data/rollouts config
+    if resume_state is not None:   # don't resume a checkpoint from a DIFFERENT data/rollouts/vocab
         prev = resume_state.get("args", {})
-        if prev.get("data") != args.data or prev.get("rollouts") != args.rollouts:
+        if (prev.get("data") != args.data or prev.get("rollouts") != args.rollouts
+                or resume_state.get("n_plan") != N_PLAN):
             print(f"[grpo] checkpoint config differs (data={prev.get('data')}, rollouts="
-                  f"{prev.get('rollouts')}) — ignoring --resume, starting fresh from {args.sft_ckpt}.")
+                  f"{prev.get('rollouts')}, n_plan={resume_state.get('n_plan')}) — ignoring --resume, "
+                  f"starting fresh from {args.sft_ckpt}.")
             resume_state = None
     load_from = args.out if resume_state is not None else args.sft_ckpt
     if resume_state is not None:

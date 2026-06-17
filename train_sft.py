@@ -33,7 +33,7 @@ CLI (A3 two-stage curriculum):
 import argparse, json, math, os, random, time
 import torch, torch.nn.functional as F
 
-from model_joint import JointModel, encode_plan, decode_plan, PAD_ID
+from model_joint import JointModel, encode_plan, decode_plan, PAD_ID, N_PLAN
 from checkers import graded_reward_for_row
 from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
                            scalar_args)
@@ -174,7 +174,7 @@ def hard_subset(model, rows, samples=8, max_resp=64, temp=1.3, err_rate=0.75):
 def _sft_state(epoch, batch_idx, global_step, opt, sched, args):
     """Resume payload: position = next (epoch, batch_idx) to run."""
     return {"kind": "sft", "epoch": epoch, "batch_idx": batch_idx, "global_step": global_step,
-            "optimizer": opt.state_dict(),
+            "n_plan": N_PLAN, "optimizer": opt.state_dict(),
             "scheduler": (sched.state_dict() if sched is not None else None),
             "torch_rng": torch.get_rng_state(), "py_rng": random.getstate(),
             "args": scalar_args(args)}
@@ -215,6 +215,13 @@ def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
         print(f"[sft:{tag}] epoch {ep+1}/{epochs} ({time.time()-t0:.1f}s) "
               f"plan_ce={run['plan_ce']/n:.4f} resp_ce={run['resp_ce']/n:.4f} kl={run['kl']/n:.4f} "
               f"| held {json.dumps(held)}")
+        if getattr(args, "metrics_out", None):   # per-epoch row for the loss table
+            rec = {"tag": tag, "epoch": ep + 1, "time_s": round(time.time() - t0, 1),
+                   "train_plan_ce": round(run["plan_ce"]/n, 4), "train_resp_ce": round(run["resp_ce"]/n, 4),
+                   "kl": round(run["kl"]/n, 4),
+                   **{f"held_{k}": round(v, 4) for k, v in held.items()}}
+            with open(args.metrics_out, "a") as mf:
+                mf.write(json.dumps(rec) + "\n")
         if ckpt is not None:   # end-of-epoch checkpoint: next position = (ep+1, 0)
             ckpt.save(model, _sft_state(ep + 1, 0, global_step, opt, sched, args),
                       reason=f"{tag}-epoch{ep+1}")
@@ -276,6 +283,8 @@ def main():
                     help="push each checkpoint to this HF model repo (e.g. user/small_fable-planner)")
     ap.add_argument("--resume", action="store_true",
                     help="resume from --out if it contains a train_state.pt (single-stage only)")
+    ap.add_argument("--metrics_out", default="sft_metrics.jsonl",
+                    help="append per-epoch train/held metrics here (for the loss table)")
     args = ap.parse_args()
     random.seed(args.seed); torch.manual_seed(args.seed)
 
@@ -292,11 +301,13 @@ def main():
     if resume_state is not None and args.curriculum:
         print("[sft] WARNING: --resume is single-stage only; ignoring it for --curriculum (starts fresh).")
         resume_state = None
-    if resume_state is not None:   # don't resume a checkpoint trained on a DIFFERENT dataset/split
+    if resume_state is not None:   # don't resume a checkpoint trained on a DIFFERENT dataset/split/vocab
         prev = resume_state.get("args", {})
-        if prev.get("data") != args.data or prev.get("train") != args.train:
-            print(f"[sft] checkpoint config differs (data={prev.get('data')} train={prev.get('train')}) "
-                  f"vs now (data={args.data} train={args.train}) — ignoring --resume, starting fresh.")
+        if (prev.get("data") != args.data or prev.get("train") != args.train
+                or resume_state.get("n_plan") != N_PLAN):
+            print(f"[sft] checkpoint config differs (data={prev.get('data')} train={prev.get('train')} "
+                  f"n_plan={resume_state.get('n_plan')}) vs now (data={args.data} train={args.train} "
+                  f"n_plan={N_PLAN}) — ignoring --resume, starting fresh.")
             resume_state = None
 
     if resume_state is not None:
