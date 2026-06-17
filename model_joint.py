@@ -146,9 +146,11 @@ class JointModel(nn.Module):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
-        # CPU has flaky/slow bf16 kernels (Qwen ships bf16); force fp32 there for a stable run.
+        # Force fp32: the planner head + plan embeddings (the soft prefix) are fp32, so the backbone
+        # MUST be fp32 too or the prefix matmul mixes Float/BFloat16 (Qwen ships bf16). CPU bf16 is
+        # also flaky, and T4 has no fast bf16 — fp32 is the correct, stable default on every device.
         if dtype is None:
-            dtype = torch.float32 if str(device) == "cpu" else "auto"
+            dtype = torch.float32
         base = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=dtype)
         backbone = build_lora(base, r=r, alpha=alpha, dropout=dropout, is_trainable=True)
         hidden = base.config.hidden_size
@@ -172,8 +174,8 @@ class JointModel(nn.Module):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
-        if dtype is None:
-            dtype = torch.float32 if str(device) == "cpu" else "auto"
+        if dtype is None:                       # fp32 everywhere — keep backbone dtype == fp32 heads
+            dtype = torch.float32
         base = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=dtype)
         backbone = PeftModel.from_pretrained(base, ckpt_dir, is_trainable=is_trainable)
         # frozen-backbone GUARD: re-assert trainability matches intent.
