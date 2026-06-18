@@ -10,7 +10,8 @@
 > ▶️ **[Train on Colab (GPU) → Hugging Face →](https://colab.research.google.com/github/sinha-k-prat/small_fable/blob/main/train_all_colab.ipynb)** &nbsp;·&nbsp;
 > 🔎 **[Inference-only Colab →](https://colab.research.google.com/github/sinha-k-prat/small_fable/blob/main/inference_colab.ipynb)** &nbsp;·&nbsp;
 > 🧩 **[Planning primitives →](PRIMITIVES.md)** &nbsp;·&nbsp;
-> ⚖️ **[Design contrasts (rejected vs chosen) →](DESIGN_CONTRASTS.md)**
+> ⚖️ **[Design contrasts →](DESIGN_CONTRASTS.md)** &nbsp;·&nbsp;
+> 🏗️ **[Architecture (base vs proposed) →](ARCHITECTURE.md)**
 
 A small model trained to behave like an **adaptive agent that switches mode from response to
 response**. A **planner head** emits a short plan per input; the shared backbone (**executor**) then
