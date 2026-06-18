@@ -1,7 +1,12 @@
 # Planning primitives
 
-The **planner** emits a *plan* — a short program the executor then follows while it reasons. The plan
-is **factored** and produced by a **single autoregressive head** over a flat token sequence:
+The model has **two separate heads over one shared (LoRA-adapted, frozen-base) backbone**: a
+**planner head** (a small linear layer over the backbone's hidden state) emits a *plan*, and the
+LoRA-adapted backbone — the **executor** — then follows that plan while it reasons in prose and commits
+a `FINAL ANSWER`. They are distinct policies (planner over the plan vocab below; executor over the
+token vocab). The plan is **factored** and produced by the planner head as a **single autoregressive
+pass** over a flat token sequence ("single" = one head composes primitives with their parameters — it
+is *not* the only head in the model):
 
 ```
 MODEL as=truth_table  LINK guard=on  VERIFY aspect=logic  FINALIZE form=yes_no  END
@@ -20,6 +25,13 @@ primitive+parameter pairing it never saw together is just a novel sequence of kn
 > `plan_vocab.json` and loaded by [`model_joint.py`](model_joint.py). The trace vocabulary below has
 > **79 tokens** (PAD + 23 primitives + 54 parameter-atoms + END). With no `plan_vocab.json` present,
 > `model_joint` falls back to a default 41-token bare vocab (for the legacy synthetic path).
+>
+> **How the heads are trained:** **both** heads are learned in **SFT** — the planner head by plan-CE,
+> the executor (LoRA adapter) by response-CE plus a KL-to-base anchor, with the shared plan-embedding
+> updated by both. **Both are then retrained in offline GRPO**, which reloads the same SFT'd adapter +
+> heads: the planner via a clipped plan-policy term + a small CE anchor to the gold plan, the executor
+> via a clipped response-policy term. The base model — including the tied LM head — stays **frozen** in
+> both stages; only the LoRA adapters and the two heads update.
 
 ---
 

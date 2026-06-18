@@ -6,7 +6,9 @@ inline comments in each file.
 ## Architecture
 
 1. **Two policies, separate action spaces, separate logprobs.**
-   The planner emits over `PLAN_VOCAB` (41 primitives); the executor emits over the token vocab.
+   The planner emits over `PLAN_VOCAB` — the factored, parameterized plan vocabulary loaded from
+   `plan_vocab.json` (primitives + `key=value` param-atoms + `END`; a bare default, 41 tokens incl. PAD,
+   only when that file is absent); the executor emits over the token vocab.
    They are different distributions, so their logprobs, ratios, and clipped objectives are kept
    independent everywhere (`joint_grpo_loss` = `L_exec_clip + beta_plan·L_plan_clip`). *Why:* a single
    shared ratio would conflate two unrelated probability spaces and corrupt both gradients.
@@ -78,10 +80,17 @@ inline comments in each file.
     the IS ratio is corrupted at step 0 and no clipping saves it (the VibeThinker train/infer-mismatch
     failure). temp=1 logprobs are the actual policy probs the ratio needs.
 
-14. **Frozen-backbone guard.**
-    RL loads the adapter with `is_trainable=True` and asserts `>0` trainable backbone tensors at
-    startup (prints the count). *Why:* `PeftModel.from_pretrained` loads adapters frozen by default; a
-    silent freeze makes RL a no-op and SFT==SFT+RL byte-for-byte. This bit a previous run.
+14. **Frozen-backbone guard — and RL retrains BOTH heads, not just the adapter.**
+    The planner head and the LoRA-adapted executor are **separate modules**, and BOTH are trained in
+    SFT (planner by plan-CE, executor adapter by response-CE/KL, shared `plan_emb` by both). RL is a
+    *continuation* of both: GRPO reloads the SFT'd adapter **and** `heads.pt` (planner + plan_emb), puts
+    every trainable param in one optimizer, and keeps updating both — the executor via the clipped
+    response term `L_exec`, the planner via the clipped plan term `beta_plan·L_plan` + the small
+    `beta_ce` gold-plan CE anchor. It loads the adapter with `is_trainable=True` and asserts `>0`
+    trainable backbone tensors at startup. *Why:* `PeftModel.from_pretrained` loads adapters frozen by
+    default; a silent freeze makes RL a no-op and SFT==SFT+RL byte-for-byte. This bit a previous run.
+    (Only the LoRA adapters + the two heads ever train; the base weights, incl. the tied LM head, stay
+    frozen in both stages.)
 
 15. **A1 MGPO MaxEnt weighting replaces "delete zero-variance groups."**
     `w_q = exp(−γ·(p_q−0.5)²)` — an **unnormalized** Gaussian in group accuracy: peak 1.0 at 0.5, no
@@ -155,7 +164,8 @@ inline comments in each file.
     info; the factored sub-token form keeps the head a single fixed action space while staying
     compositional — a novel primitive+param pairing is a novel sequence of known tokens. The vocab is
     written to `plan_vocab.json` by `traces_to_sft.py` and loaded by `model_joint.py` (default 41-token
-    bare vocab if absent). `plan_max_len=24`.
+    bare vocab if absent). The traces run sets `--plan_max_len 24` in the notebook (factored sequences
+    reach ~17 tokens); the code default is 12.
 
 25. **Executor target = reasoning prose + `FINAL ANSWER: <canonical>`.** The executor learns to reason
     in text and then commit a canonical answer (GSM8K-style). *Why:* coherent reasoning AND precise

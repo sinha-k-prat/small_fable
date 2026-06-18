@@ -22,7 +22,9 @@ to the trace files (1:1, verified).
 
 ## How RL should grade (match.type)
 
-Parse the model's FINALIZE output, then grade against `canonical` using `match.type`:
+Parse the model's committed answer — the prose after the last `FINAL ANSWER:` marker (training appends
+this marker; the checker grades only that span, falling back to the tail if absent; `FINALIZE[...]` is a
+planner plan token, *not* the graded text) — then grade against `canonical` using `match.type`:
 
 - **exact_choice** — normalize model answer to a label; reward 1 if it is in
   `match.accept`, else 0. Used for `yes_no` (`"yes"`/`"no"`) and
@@ -75,7 +77,7 @@ Parse the model's FINALIZE output, then grade against `canonical` using `match.t
 ```
 reward = base_match_score
        - step_penalty * num_plan_steps          # discourage ceremony
-       + form_bonus  if model FINALIZE form == answer_form
+       + form_bonus  if the form committed in FINAL ANSWER == answer_form
        + calibration_bonus  if confidence high and correct (penalize confident-wrong)
 ```
 The `answer_form` field lets you additionally reward the model for committing the

@@ -17,7 +17,9 @@ Legend:   ✗ = the alternative that was rejected      ✓ = what was chosen ins
         ✗ plan = special/text tokens in the LM's own vocabulary  (the "planning tokens" route)
           planning blurs into prose — not a thing you can steer or reward on its own
    ───────────────────────────────────── instead ─────────────────────────────────────
-        ✓ plan = a SEPARATE 41-primitive vocabulary with its own head + embeddings
+        ✓ plan = a SEPARATE planner vocabulary with its own head + embeddings
+          (synthetic fallback: 41 tokens; the reasoning-traces pipeline uses a FACTORED vocab =
+          primitives + key=value param-atoms + END — see §E)
           a discrete action space you can reinforce as an independent policy
 ```
 **Why:** planning becomes first-class and RL-able, not more text.
@@ -28,9 +30,14 @@ Legend:   ✗ = the alternative that was rejected      ✓ = what was chosen ins
           two models to host, train, and keep in sync
    ───────────────────────────────────── instead ─────────────────────────────────────
         ✓ an autoregressive planner HEAD reading the SHARED backbone's hidden states
-          one backbone, two heads; LoRA serves both paths
+          one backbone, TWO SEPARATE HEADS (planner linear + executor LM path) + a shared plan_emb
 ```
 **Why:** the plan is conditioned on the same prompt representation the answer is — true "one model."
+**Both heads are trained in SFT and BOTH are retrained in RL** from the same SFT checkpoint (GRPO
+reloads the SFT adapter + planner head + plan_emb): in SFT the planner is trained by plan-CE and the
+executor adapter by response-CE/KL; in GRPO the planner is updated by the clipped plan-policy term + a
+small CE anchor and the executor by the clipped response term. The frozen base model — including the
+tied LM head — is never trained in either stage; only the LoRA adapter, planner head, and plan_emb move.
 
 ### 3. How the plan reaches the answer
 ```
@@ -286,7 +293,8 @@ thought through, not just a stock GRPO wiring:
 ```
                               ┌─────────────────────────────────────────┐
    prompt ──▶ [ SHARED Qwen-1.5 backbone + LoRA ] ──┬──▶ planner head ──▶ PLAN   ★1
-                              └─────────────────────┘   (41 primitives)   │
+                              └─────────────────────┘  (factored vocab:    │
+                                                         primitives+params+END)
                                         ▲                                 ▼ soft prefix
                                         │                         [ executor ] ──▶ ANSWER
                                         │                                 │

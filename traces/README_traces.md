@@ -1,6 +1,14 @@
 # Hard Reasoning Traces - 3000 examples (3 x 1000)
 
-Training data for a small LLM acting as a primitive-modular reasoning engine.
+Training data for a small LLM acting as a primitive-modular reasoning engine. The model has TWO
+separate heads over a shared (LoRA-adapted, frozen-base) backbone: a PLANNER head that emits the
+factored parameterized plan, and an EXECUTOR (the LoRA adapter, with a shared soft plan-embedding
+prefix) that emits the prose reasoning and commits the final answer. **Both heads are trained in SFT**
+(planner by plan cross-entropy, executor by response cross-entropy/KL) **and BOTH are then retrained in
+off-policy GRPO** from those same SFT checkpoints (planner via a clipped plan-policy term + a small CE
+anchor, executor via a clipped response-policy term); the frozen base-model weights — including the
+tied LM head — are never trained in either stage.
+
 Three sets of 1000 traces each. Every example is hard for a non-thinking model,
 and the three sets are deliberately related so that a model which MEMORIZED one
 set must still REASON to solve the others.
@@ -46,6 +54,16 @@ shape, three different required reasonings and two different answers.
 - Parameters use commas inside [...]; ' ; ' separates primitives within a turn.
 - Responses are plain prose executing the turn's primitives in order (no indexing).
 - FINALIZE commits the answer in the matching form; the trace ends with: accepted
+
+How a raw trace becomes the two SFT targets (see `traces_to_sft.py`):
+- **Planner target** = a FACTORED, parameterized plan: each primitive followed by its `key=value`
+  parameter atoms, in order, terminated by an explicit `END` token
+  (e.g. `MODEL as=truth_table LINK guard=on VERIFY aspect=logic FINALIZE form=yes_no END`). A single
+  autoregressive head composes primitives with params, so a novel primitive+param pairing is just a
+  novel sequence of already-seen tokens.
+- **Executor target** = the full reasoning prose (all `response:` lines joined). When a verifiable
+  answer key exists, a `FINAL ANSWER: <committed value>` line is appended so the model reasons THEN
+  commits and the checker grades only that commitment.
 
 ## Integrity (verified)
 

@@ -16,9 +16,15 @@ A small model trained to behave like an **adaptive agent that switches mode from
 response**. A **planner head** emits a short plan per input; the shared backbone (**executor**) then
 produces the answer **conditioned on that plan**. Two training stages:
 
-1. **SFT** on gold `(instruction → plan, answer)` pairs.
-2. **Offline GRPO** that improves executor + planner from the model's *own sampled* rollouts, scored
-   by a verifiable programmatic checker (not NLL, not embedding-similarity).
+The planner head and executor are **separate heads** sharing one LoRA-adapted backbone, and **both are
+trained in SFT and both are retrained in RL** from the same SFT checkpoint:
+
+1. **SFT** trains both jointly — the planner head via plan-CE, the executor (LoRA adapter) via
+   answer-CE/KL, the shared plan-embedding by both.
+2. **Offline GRPO** further updates **both** from those SFT checkpoints on the model's *own sampled*
+   rollouts, scored by a verifiable programmatic checker (not NLL, not embedding-similarity): the
+   planner via a clipped plan-policy term + a small gold-plan CE anchor, the executor via a clipped
+   response-policy term. The frozen base model (incl. the tied LM head) is never trained in either stage.
 
 The headline property is that the **plan is load-bearing**: the answer depends on the plan chosen.
 We measure this directly with the **plan-vs-no-plan ablation gap**.
@@ -31,14 +37,25 @@ We measure this directly with the **plan-vs-no-plan ablation gap**.
 > as an unseen *memorize-vs-reason* generalization test. See [`PRIMITIVES.md`](PRIMITIVES.md),
 > [`DESIGN_CONTRASTS.md`](DESIGN_CONTRASTS.md) §E, and [`important_design_choices.md`](important_design_choices.md).
 
-## Architecture (one model, two heads, LoRA everywhere)
+## Architecture (one backbone, two separate heads, LoRA only)
+The planner head and the executor are **separate modules sharing one LoRA-adapted backbone**, and
+**both are trained in SFT and both are retrained in RL** from the same SFT checkpoint. The frozen base
+model — including the tied LM head — is **never trained** in either stage; only the LoRA adapters, the
+planner head, and the plan embeddings receive gradients.
+
 - **Executor** = `Qwen/Qwen2.5-1.5B-Instruct` causal LM + **LoRA on all 7 projection matrices**
-  (`q,k,v,o,gate,up,down`, r=16, α=32, dropout=0.05). One adapter shared by both paths.
-- **Planner head** = a linear head over the backbone's last-layer hidden states emitting **plan
-  primitive** logits over a **separate** vocabulary (`PLAN_VOCAB`, 41 primitives). It is
-  autoregressive: each chosen primitive is re-fed as a learned **plan embedding**.
-- **Plan embeddings** = the chosen plan is embedded and prepended as a **soft prefix** (vectors in
-  hidden space) so the executor is conditioned on the plan before it writes the answer.
+  (`q,k,v,o,gate,up,down`, r=16, α=32, dropout=0.05). The "executor" that trains is the LoRA adapter
+  (the base weights stay frozen). Trained in SFT by response-CE/KL; retrained in RL by the clipped
+  response-policy term.
+- **Planner head** = a *separate* linear head over the backbone's last-layer hidden states emitting
+  plan-token logits over its own plan vocabulary (distinct from the executor token vocab). Trained in
+  SFT by plan-CE; retrained in RL by the clipped plan-policy term + a small gold-plan CE anchor.
+  In the live (traces) run the vocab is **factored/parameterized** — `traces_to_sft.py` writes
+  `plan_vocab.json` (primitives + `key=value` atoms + `END`) and the head is sized to it; the static
+  41-token `PLAN_VOCAB` (ending in `TERMINATE`) is the legacy fallback when no `plan_vocab.json` exists.
+- **Plan embeddings** (`plan_emb`) = the chosen plan, embedded and prepended as a **soft prefix**, so
+  the executor is conditioned on the plan before it writes. *Shared:* updated by **both** heads' losses
+  in SFT and RL (so the planner/executor parameter groups are not perfectly disjoint).
 - **Two policies, kept separate everywhere**: planner (plan vocab) and executor (token vocab) have
   **independent logprobs and independent clipped RL objectives**. They are never mixed.
 
@@ -169,15 +186,18 @@ python tests/test_pipeline_smoke.py     # full two-head wiring on a tiny Qwen2 (
 ```
 
 ## Data
-`dataset/sft_100.jsonl` (default, 100 rows) and `dataset/sft_flat.jsonl` (1000 rows, to scale up).
-Schema:
+**The live experiment trains on real hard reasoning traces** (`traces/`, sets 1000+2000, holding out
+set 3000) converted by `traces_to_sft.py` into a factored plan + a full-prose answer that ends in a
+`FINAL ANSWER:` commit. Schema (post-conversion):
 ```json
-{"id":"ex_0000","category":"arithmetic","instruction":"...",
- "plan":["GENERATE_ALT","EVAL","SELECT","VERIFY_LOGIC","SIMULATE","CORRECT","TERMINATE"],
- "answer":"$3450.","checker_kind":"exact","checker_args":{"gold":"3450."}}
+{"id":"trace_00000","instruction":"...",
+ "plan":["MODEL","as=state_machine","SIMULATE","depth=deep","FINALIZE","form=number_with_units","END"],
+ "answer":"...reasoning prose...\nFINAL ANSWER: 9 days",
+ "checker_kind":"numeric","checker_args":{"canonical":{"value":9,"unit":"days"},"match":{"type":"numeric","tolerance":0.01}}}
 ```
-**The bundled data is synthetic** (template-generated) — correct for proving the pipeline and the
-ablation gap end-to-end. Before drawing quality conclusions, replace with real tasks in the same
+The bundled `dataset/sft_100.jsonl` / `sft_flat.jsonl` are a legacy **synthetic** (template-generated)
+demo corpus (bare-vocab plans + terse answers) — correct for proving the pipeline and the
+ablation gap end-to-end, but not the current training data. Before drawing quality conclusions, replace with real tasks in the same
 schema or expand via `build_sensitivity_corpus.py --base Qwen/Qwen2.5-1.5B-Instruct` so tasks are
 filtered for planning sensitivity (`P(correct|plan) ≫ P(correct|no plan)`), guaranteeing SFT
 headroom and GRPO group variance.
