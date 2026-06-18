@@ -137,7 +137,9 @@ def make_checker(kind, args):
         ans, _canon_value(args["canonical"]), args["match"]["accept"], args["match"].get("tolerance", 0.0))
     if kind=="exact_term":      return lambda ans: check_exact_term(ans, args["match"]["accept"])
     if kind=="role_map":        return lambda ans: check_role_map(ans, args["canonical"]["roles"])
-    if kind=="string_contains": return lambda ans: check_string_contains(ans, args["match"]["key_phrase"])
+    if kind=="string_contains":
+        phrase = args.get("match", {}).get("key_phrase") or _canon_value(args.get("canonical"))
+        return lambda ans: check_string_contains(ans, phrase)
     if kind=="plan_rubric":     return lambda ans: check_plan_rubric(ans, args["canonical"]["gold_summary"])
     raise ValueError(f"unknown checker_kind: {kind}")
 
@@ -152,10 +154,14 @@ def check_rubric(model_answer, items):
 
 def reward_for_row(row, model_answer):
     """Score a model answer against a row's gold checker. {0.0,1.0} for exact/contains_all,
-    graded [0,1] for rubric."""
-    if row["checker_kind"] == "rubric":
-        return check_rubric(model_answer, row["checker_args"]["items"])
-    return make_checker(row["checker_kind"], row["checker_args"])(model_answer)
+    graded [0,1] for rubric. A malformed/variant answer-key row must NEVER crash an eval or training
+    loop — any grader error degrades to 0.0 (treated as 'not solved')."""
+    try:
+        if row["checker_kind"] == "rubric":
+            return check_rubric(model_answer, row["checker_args"]["items"])
+        return make_checker(row["checker_kind"], row["checker_args"])(model_answer)
+    except Exception:
+        return 0.0
 
 def graded_reward_for_row(row, model_answer):
     """Alias making the graded intent explicit at call sites (A1b)."""
