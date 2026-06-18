@@ -185,3 +185,60 @@ inline comments in each file.
 
 28. **Resume guard also checks `n_plan` (vocab size).** *Why:* the planner head is sized to the vocab;
     a checkpoint from a different vocab must not be loaded into a differently-sized model.
+
+## Parameter inventory & data flow (what trains, what's frozen)
+
+Verified against `model_joint.py` (decoder-only Qwen2.5-1.5B; `tie_word_embeddings=true`, so the input
+embedding and the LM head are the **same** frozen tensor).
+
+| Tensor group | Base (plain Qwen) | Proposed (joint planner+executor) |
+|---|---|---|
+| `embed_tokens` (vocab input) | pretrained | ❄ **frozen** |
+| `lm_head` (output, **tied** to `embed_tokens`) | = embed | ❄ **frozen** |
+| RMSNorm gains (per-layer + final) | pretrained | ❄ **frozen** |
+| `q/k/v` attention **biases** | pretrained | ❄ **frozen** (`bias="none"`) |
+| `q,k,v,o,gate,up,down` weights | full | base ❄ frozen **+** ▣ **LoRA** delta trained (r=16) |
+| `plan_emb` (plan-token **input** embedding / soft prefix) | — | ★ **fully trained** (new module) |
+| `planner` head (plan-token **output** logits) | — | ★ **fully trained** (new module) |
+
+`plan_emb` (input) and `planner` (output) are **separate, untied** modules — unlike the vocab
+embedding ↔ LM head which *are* tied. The factored plan vocab puts **both primitives and
+parameter-atoms in the one `plan_emb` table** (each `key=value` is its own token id) — there is no
+separate "parameter embedding". Both heads are trained in SFT and **retrained in RL**; the frozen base
+(incl. tied LM head) is never trained in either stage.
+
+```
+LEGEND:  ❄ frozen    ▣ LoRA delta trained (base slice frozen)    ★ fully trained (new module)
+
+BASE — Qwen2.5-1.5B (plain causal LM)
+   ids ─► embed_tokens ❄ ─►[ 28× block: attn q,k,v,o ❄ | mlp gate,up,down ❄ | RMSNorm ❄ | qkv bias ❄ ]─► lm_head ❄ ─► token logits
+
+PROPOSED — one shared backbone, TWO heads (plan-then-execute)
+
+ (1) PLAN phase  — planner rolls the plan out autoregressively
+       prompt ─► embed_tokens ❄ ─┐
+       plan-so-far ─► plan_emb ★ ─┤►┌───────────────────────────────────────┐
+                                   │ │ SHARED backbone                       │─► last hidden ─► planner head ★ ─► next PLAN token
+                                   └►│  attn q,k,v,o   base ❄ + LoRA ▣        │                                  (MODEL, as=rate, … END)
+                                     │  mlp g,u,d      base ❄ + LoRA ▣        │
+                                     │  RMSNorm ❄    qkv bias ❄               │
+                                     └───────────────────────────────────────┘   (repeat until END)
+
+ (2) EXECUTE phase — executor answers, conditioned on the finished plan as a SOFT PREFIX
+       [ prompt ❄ | plan_emb ★ (whole plan, incl END) | answer-so-far ❄ ] ─► SAME backbone (LoRA ▣) ─► last hidden ─► lm_head ❄ ─► next ANSWER token
+                                                                                                                          (prose … FINAL ANSWER: X)
+
+ Trained:  ▣ LoRA on the 7 projections  +  ★ planner head  +  ★ plan_emb.
+ Frozen ❄: embed_tokens, tied lm_head, all RMSNorms, q/k/v biases, and the base projection weights.
+```
+
+### The plan→execute boundary and its gradients
+There is **no explicit "begin-execution" token**. The phase boundary is the plan's **`END`
+terminator** (a plan-vocab token the planner learns to emit); execution then begins *automatically* by
+generating after the plan soft-prefix (the chat template's assistant marker + the prefix delimit it).
+Crucially, the boundary is **not** a frozen structural marker — **gradients pass through it from both
+heads**: `plan_emb[END]` is updated by the **planner** loss (learning *when* to stop planning) **and**
+by the **executor** loss, because the whole plan (incl. `END`) is the soft prefix conditioning the
+answer, so `resp_CE` back-props into `plan_emb[END]`. So ending the plan automatically starts
+execution **and** that transition representation is learned end-to-end — a separate trainable
+"BEGIN_ANSWER" token would be redundant given `END` + the soft-prefix structure already play that role.
