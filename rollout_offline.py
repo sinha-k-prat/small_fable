@@ -59,6 +59,99 @@ def resp_mask_from_ids(ids, eos_id, pad_id):
     return mask, max(trim, 1)
 
 
+def _rec_to_turns(model, rec):
+    """run_interleaved record {turns:[{plan:[ids],resp:[ids]}]} -> the turns_batch schema
+    interleaved_tf/_build_interleaved_row consume: [{'plan':[str], 'response':str}]. Plan ids are
+    decoded to primitive names; the EOP/FINALIZE markers are stripped (the assembler re-inserts them);
+    the response ids are decoded to text (RESP_EOS stripped, re-inserted by the assembler)."""
+    from model_joint import ID2PLAN, EOP_ID, FINALL_ID, BOP_ID
+    turns = []
+    for tn in rec["turns"]:
+        plan_names = [ID2PLAN[int(i)] for i in tn["plan"]
+                      if int(i) not in (EOP_ID, FINALL_ID, BOP_ID) and int(i) in ID2PLAN]
+        resp_ids = [i for i in tn["resp"] if i != model.resp_eos_id]
+        if not resp_ids:                       # a finalize-only turn carries no response
+            continue
+        text = model.tok.decode(resp_ids, skip_special_tokens=True)
+        turns.append({"plan": plan_names, "response": text})
+    if not turns:                              # guarantee at least one gradeable turn
+        turns = [{"plan": [], "response": ""}]
+    return turns
+
+
+def _main_interleaved(args):
+    """Agentic closed-loop rollout. For each instruction draw G full trajectories with run_interleaved,
+    grade the last turn's prose tail, then recompute temp=1 teacher-forced logp via interleaved_logp_tf
+    and CONCATENATE all turns' plan tokens into one plan stream and all turns' resp tokens into one resp
+    stream — exactly the PLAN/RESP position sets joint_grpo_loss consumes (A6 ratio==1 at pass 0)."""
+    from model_joint import JointModel as _JM
+    rows = [json.loads(l) for l in open(args.data)][:args.train]
+    print(f"[rollout:interleaved] {len(rows)} instructions x G={args.group} @ temp={args.temp}")
+    model = _JM.from_checkpoint(args.base, args.sft_ckpt, device=args.device, is_trainable=False)
+    model.eval()
+    model._assert_interleaved()
+
+    n_written = zero_var = dropped = 0
+    rew_sum = 0.0
+    t0 = time.time()
+    report_rows = []
+    with open(args.out, "w") as fout:
+        for ri, r in enumerate(rows):
+            G = args.group
+            path = reward_path_for_row(r)
+            p_ids, p_attn = model.batch_prompts([r["instruction"]])
+            rewards, group_recs = [], []
+            for g in range(G):
+                rec = model.run_interleaved(p_ids[0], p_attn[0], temp=args.temp, sample=True,
+                                            max_turns=args.max_turns, max_plan=args.max_plan,
+                                            max_resp=args.max_resp)
+                turns = _rec_to_turns(model, rec)
+                ans = model.interleaved_answer_text(rec)
+                rew = graded_reward_for_row(r, ans)
+                rewards.append(rew)
+                # A6: recompute temp=1 logp via the SAME teacher-forced path the trainer uses, then
+                # CONCATENATE across turns into one plan stream + one resp stream.
+                with torch.no_grad():
+                    pl, pm, rl, rm = model.interleaved_logp_tf(p_ids, p_attn, [turns], temp=1.0)
+                pm0 = pm[0].bool(); rm0 = rm[0].bool()
+                # the recorded token id at each masked position == the teacher-forced target there.
+                (_h, _lm, _pm, ptgt, _rm, rtgt, _a, raw, _e) = model.interleaved_tf(
+                    p_ids, p_attn, [turns])
+                plan_tokens = raw[0][pm0].tolist()
+                resp_tokens = raw[0][rm0].tolist()
+                group_recs.append({
+                    "id": r["id"], "instruction": r["instruction"], "group_size": G,
+                    "reward_path": path, "reward": rew, "interleaved": True,
+                    "turns": turns,
+                    "plan_tokens": plan_tokens, "plan_logp_old": pl[0][pm0].tolist(),
+                    "resp_tokens": resp_tokens, "resp_logp_old": rl[0][rm0].tolist(),
+                    "resp_len": int(rm0.sum()), "answer_text": ans,
+                    "plan_str": [ID for tn in turns for ID in tn["plan"]],
+                })
+            rew_t = torch.tensor(rewards)
+            p_q = float(rew_t.mean()); std = float(rew_t.std(unbiased=False))
+            keep = std > 1e-6 if args.filter else True
+            for rec in group_recs:
+                rec["p_q"] = p_q; rec["keep"] = bool(keep)
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n_written += 1
+            report_rows.append((r["id"], path, p_q, std, int(keep)))
+            rew_sum += p_q
+            if std < 1e-6:
+                zero_var += 1
+            if not keep:
+                dropped += 1
+            if (ri + 1) % 10 == 0:
+                print(f"[rollout:interleaved] {ri+1}/{len(rows)} mean_reward={rew_sum/(ri+1):.3f} "
+                      f"zero_var={zero_var}/{ri+1} dropped={dropped} ({time.time()-t0:.0f}s)")
+    with open(args.report, "w", newline="") as rf:
+        w = csv.writer(rf); w.writerow(["id", "reward_path", "p_q", "std", "kept"])
+        w.writerows(report_rows)
+    print(f"[rollout:interleaved] wrote {n_written} rollouts -> {args.out}")
+    print(f"[rollout:interleaved] mean reward={rew_sum/max(1,len(rows)):.3f} | zero-variance groups="
+          f"{zero_var}/{len(rows)} | A2-dropped={dropped}. Report -> {args.report}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sft_ckpt", default="joint_ckpt")
@@ -76,8 +169,16 @@ def main():
     ap.add_argument("--no-filter", dest="filter", action="store_false")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=20260616)
+    ap.add_argument("--interleaved", action="store_true",
+                    help="agentic closed-loop rollout: run_interleaved + ONE concatenated plan/resp "
+                         "stream per trajectory (fed UNCHANGED to joint_grpo_loss).")
+    ap.add_argument("--max_turns", type=int, default=6)
+    ap.add_argument("--max_plan", type=int, default=12)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
+
+    if args.interleaved:
+        return _main_interleaved(args)
 
     rows = [json.loads(l) for l in open(args.data)][:args.train]
     print(f"[rollout] {len(rows)} instructions x G={args.group} @ temp={args.temp}")

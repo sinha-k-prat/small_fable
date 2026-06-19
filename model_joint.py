@@ -51,8 +51,11 @@ _VOCAB_FILE = os.environ.get("PLAN_VOCAB_FILE",
 if os.path.exists(_VOCAB_FILE):
     _vc = json.load(open(_VOCAB_FILE))
     PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", "TERMINATE")
+    INTERLEAVED_VOCAB = bool(_vc.get("interleaved", False))
+    _MARKERS = _vc.get("markers", {})
 else:
     PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = "TERMINATE"
+    INTERLEAVED_VOCAB = False; _MARKERS = {}
 PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
 ID2PLAN = {i:p for p,i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
@@ -62,6 +65,15 @@ _TERM_BASE = _TERM_NAME.split("[")[0]
 TERM_IDS = {i for p, i in PLAN2ID.items() if p.split("[")[0] == _TERM_BASE}
 TERM_ID = min(TERM_IDS) if TERM_IDS else len(PLAN_VOCAB) - 1
 N_PLAN  = len(PLAN_VOCAB)
+
+# Interleaved (agentic) control-marker ids. These are PLAN-vocab ids (embedded by plan_emb, predicted
+# by the planner). On a FLAT vocab they are None and the interleaved path asserts out (see
+# _assert_interleaved). EOP (the per-turn plan terminator / handoff) reuses the existing END/TERM_ID.
+BOP_ID    = PLAN2ID.get(_MARKERS.get("BOP", "BOP"))
+FINALL_ID = PLAN2ID.get(_MARKERS.get("FINALIZE_ALL", "FINALIZE_ALL"))
+# PLAN_EOS == per-turn handoff: prefer the marker name, fall back to the existing terminator id.
+_eop_name = _MARKERS.get("PLAN_EOS", _TERM_NAME)
+EOP_ID    = PLAN2ID.get(_eop_name, TERM_ID)
 
 
 def build_lora(base_model, r=16, alpha=32, dropout=0.05, is_trainable=True):
@@ -153,6 +165,10 @@ class JointModel(nn.Module):
         self.plan_max_len = plan_max_len
         self.planner = PlannerHead(hidden)
         self.plan_emb = PlanEmbedding(N_PLAN, hidden)
+        # RESP_EOS (per-turn response terminator) is a TEXT id (no plan-vocab / no text-vocab growth):
+        # reuse the tokenizer eos / <|im_end|>. Resolved here so run_interleaved + the assembler agree.
+        self.resp_eos_id = getattr(tokenizer, "eos_token_id", None)
+        self.interleaved = INTERLEAVED_VOCAB
 
     # ---- construction --------------------------------------------------------
     @classmethod
@@ -211,8 +227,13 @@ class JointModel(nn.Module):
         torch.save({"planner": self.planner.state_dict(),
                     "plan_emb": self.plan_emb.state_dict()},
                    os.path.join(out_dir, "heads.pt"))
-        json.dump({"base": base_name, "plan_max_len": self.plan_max_len, "hidden": self.hidden},
-                  open(os.path.join(out_dir, "joint_config.json"), "w"), indent=2)
+        cfg = {"base": base_name, "plan_max_len": self.plan_max_len, "hidden": self.hidden,
+               "n_plan": N_PLAN}
+        if getattr(self, "interleaved", False):   # only stamp interleaved metadata when active
+            cfg["interleaved"] = True
+            cfg["markers"] = {"BOP": BOP_ID, "PLAN_EOS": EOP_ID, "FINALIZE_ALL": FINALL_ID,
+                              "RESP_EOS_text": self.resp_eos_id}
+        json.dump(cfg, open(os.path.join(out_dir, "joint_config.json"), "w"), indent=2)
 
     # ---- low-level helpers ---------------------------------------------------
     @property
@@ -355,6 +376,204 @@ class JointModel(nn.Module):
         with self.backbone.disable_adapter():
             with torch.no_grad():
                 return self.executor_logits_tf(prompt_ids, prompt_attn, plan_ids, resp_ids, resp_attn)
+
+    # ======================================================================== #
+    # INTERLEAVED (agentic, closed-loop) path. Everything below is gated by the #
+    # interleaved plan-vocab (BOP/FINALIZE_ALL markers); the flat methods above  #
+    # are untouched and byte-identical so the existing tests stay green.         #
+    # ======================================================================== #
+    def _assert_interleaved(self):
+        assert BOP_ID is not None and FINALL_ID is not None, (
+            "interleaved requested but plan_vocab.json has no BOP/FINALIZE_ALL markers "
+            "(a FLAT vocab was loaded). Regenerate with traces_to_sft.py --interleaved.")
+        assert self.resp_eos_id is not None, "interleaved requires tokenizer.eos_token_id (RESP_EOS)."
+
+    def _resp_token_ids(self, text):
+        """Tokenize one response chunk to a flat list of text ids (no special tokens)."""
+        return self.tok(text, add_special_tokens=False)["input_ids"]
+
+    def _build_interleaved_row(self, prompt_ids_1, prompt_attn_1, turns):
+        """Assemble ONE interleaved hidden-space stream in a single pass so emb / seg / target stay
+        aligned (next-token-shifted). Returns parallel lists (E,A,S,T):
+          seg in {0=IGNORE, 1=PLAN, 2=RESP}; at position p we PREDICT token T[p], owned by head S[p].
+        Marker SOURCE positions and prompt-interior/PAD are IGNORE; every non-ignore position is owned
+        by exactly ONE head (asserted in interleaved_tf)."""
+        dev = self.device
+        E, A, S, T = [], [], [], []
+
+        def add(vec, a, seg, tgt):
+            E.append(vec); A.append(int(a)); S.append(seg); T.append(tgt)
+
+        plan_e = lambda pid: self.plan_emb(torch.tensor([pid], device=dev))[0]
+        text_e = lambda tid: self.embed_tokens(torch.tensor([tid], device=dev))[0]
+        # prompt: every position IGNORE except the LAST real prompt pos, whose next token is BOP (PLAN).
+        p_emb = self.embed_tokens(prompt_ids_1.unsqueeze(0))[0]                  # (Tp,H)
+        Tp = p_emb.size(0)
+        for j in range(Tp):
+            last = (j == Tp - 1)
+            add(p_emb[j], int(prompt_attn_1[j]), (1 if last else 0), (BOP_ID if last else -100))
+        for t, turn in enumerate(turns):
+            plan_ids = [PLAN2ID.get(p, PLAN2ID.get(str(p).split('[')[0], PAD_ID)) for p in turn['plan']]
+            seq_plan = [BOP_ID] + plan_ids + [EOP_ID]                            # markers wrap the plan
+            resp_ids = self._resp_token_ids(turn.get('response', '')) or [self.resp_eos_id]
+            seq_resp = resp_ids + [self.resp_eos_id]
+            for k, pid in enumerate(seq_plan):
+                if k + 1 < len(seq_plan):
+                    add(plan_e(pid), 1, 1, seq_plan[k + 1])                      # predict next PLAN id
+                else:                                                            # EOP pos -> resp[0]
+                    add(plan_e(pid), 1, 2, seq_resp[0])                          # RESP target (handoff)
+            for k, tid in enumerate(seq_resp):
+                if k + 1 < len(seq_resp):
+                    add(text_e(tid), 1, 2, seq_resp[k + 1])                      # predict next TEXT id
+                else:                                                            # RESP_EOS -> next plan
+                    nxt = BOP_ID if t + 1 < len(turns) else FINALL_ID
+                    add(text_e(tid), 1, 1, nxt)                                  # PLAN target (finalize?)
+        add(plan_e(FINALL_ID), 1, 0, -100)                                       # terminal, no target
+        return E, A, S, T
+
+    def interleaved_tf(self, prompt_ids, prompt_attn, turns_batch):
+        """Batched teacher-forced interleaved forward (ONE backbone call, output_hidden_states).
+        Returns (h, lm_logits, plan_mask, plan_targets, resp_mask, resp_targets, attn, raw_tgt, emb)."""
+        self._assert_interleaved()
+        rows = [self._build_interleaved_row(prompt_ids[b], prompt_attn[b], turns_batch[b])
+                for b in range(len(turns_batch))]
+        B = len(rows); S = max(len(r[0]) for r in rows); H = self.hidden; dev = self.device
+        emb  = torch.zeros(B, S, H, device=dev)
+        attn = torch.zeros(B, S, dtype=torch.long, device=dev)
+        seg  = torch.zeros(B, S, dtype=torch.long, device=dev)
+        tgt  = torch.full((B, S), -100, dtype=torch.long, device=dev)
+        for b, (E, A, Sg, Tt) in enumerate(rows):                                # RIGHT-pad the stream
+            n = len(E)
+            emb[b, :n] = torch.stack(E)
+            attn[b, :n] = torch.tensor(A, device=dev)
+            seg[b, :n] = torch.tensor(Sg, device=dev)
+            tgt[b, :n] = torch.tensor(Tt, device=dev)
+        out = self.backbone(inputs_embeds=emb, attention_mask=attn, output_hidden_states=True)
+        h, lm_logits = out.hidden_states[-1], out.logits
+        plan_m = (seg == 1) & (tgt != -100)
+        resp_m = (seg == 2) & (tgt != -100)
+        assert not (plan_m & resp_m).any(), "a position is owned by BOTH heads (alignment broken)"
+        return (h, lm_logits, plan_m, tgt.clamp_min(0), resp_m, tgt.clamp_min(0), attn, tgt, emb)
+
+    def interleaved_loss(self, prompt_ids, prompt_attn, turns_batch, lam_resp=1.0, lam_kl=0.1):
+        """SFT loss over the interleaved stream: plan CE (planner head on PLAN positions) +
+        lam_resp*resp CE (lm_head on RESP positions) + lam_kl*KL(executor||base) on RESP positions."""
+        (h, lm_logits, plan_m, _, resp_m, _, attn, tgt, emb) = self.interleaved_tf(
+            prompt_ids, prompt_attn, turns_batch)
+        plan_logits = self.planner(h)                                            # (B,S,N_PLAN)
+        ce_plan = (F.cross_entropy(plan_logits[plan_m], tgt[plan_m]) if plan_m.any()
+                   else (plan_logits.sum() * 0.0))
+        ce_resp = (F.cross_entropy(lm_logits[resp_m], tgt[resp_m]) if resp_m.any()
+                   else (lm_logits.sum() * 0.0))
+        kl = torch.zeros((), device=h.device)
+        if lam_kl > 0 and resp_m.any():
+            with self.backbone.disable_adapter():
+                with torch.no_grad():
+                    base_lm = self.backbone(inputs_embeds=emb, attention_mask=attn).logits  # SAME embeds
+            lp = F.log_softmax(lm_logits[resp_m], -1)
+            lq = F.log_softmax(base_lm[resp_m], -1)
+            kl = (lp.exp() * (lp - lq)).sum(-1).mean()
+        loss = ce_plan + lam_resp * ce_resp + lam_kl * kl
+        return loss, {"ce_plan": float(ce_plan), "ce_resp": float(ce_resp), "kl": float(kl)}
+
+    def interleaved_logp_tf(self, prompt_ids, prompt_attn, turns_batch, temp=1.0):
+        """RL logp recompute over the WHOLE multi-turn trajectory, teacher-forcing the recorded turns.
+        Returns (plan_logp (B,S), plan_mask (B,S), resp_logp (B,S), resp_mask (B,S)) — concatenated
+        across ALL turns: exactly the PLAN/RESP position sets joint_grpo_loss consumes."""
+        (h, lm_logits, plan_m, _, resp_m, _, attn, tgt, _) = self.interleaved_tf(
+            prompt_ids, prompt_attn, turns_batch)
+        # PLAN targets are plan-vocab ids (< N_PLAN); RESP targets are TEXT ids (< text vocab). Gather
+        # each head ONLY at its own positions (clamp the other positions to 0 so gather is in-range).
+        plan_idx = torch.where(plan_m, tgt, torch.zeros_like(tgt)).unsqueeze(-1)
+        resp_idx = torch.where(resp_m, tgt, torch.zeros_like(tgt)).unsqueeze(-1)
+        pl = F.log_softmax(self.planner(h) / temp, -1).gather(-1, plan_idx).squeeze(-1)
+        rl = F.log_softmax(lm_logits / temp, -1).gather(-1, resp_idx).squeeze(-1)
+        return pl * plan_m.float(), plan_m.float(), rl * resp_m.float(), resp_m.float()
+
+    @torch.no_grad()
+    def run_interleaved(self, prompt_ids_1, prompt_attn_1, temp=1.0, sample=True,
+                        max_turns=6, max_plan=12, max_resp=64, force_plan=None, verbose=False):
+        """Closed-loop, marker-driven decode for ONE prompt. force_plan(turn_idx)->list[plan ids]
+        overrides the planner (ablations: []=empty plan, random ids=shuffle), keeping the handoff
+        structure intact. Records per-turn {plan:[ids], resp:[ids]}. verbose -> transparent per-turn
+        decode logging the operator asked for."""
+        self._assert_interleaved()
+        dev = self.device
+        emb = self.embed_tokens(prompt_ids_1.unsqueeze(0))                        # (1,Tp,H)
+        attn = prompt_attn_1.unsqueeze(0).to(dev)
+        rec = {"turns": []}
+
+        def fwd():
+            o = self.backbone(inputs_embeds=emb, attention_mask=attn, output_hidden_states=True)
+            return o.hidden_states[-1][:, -1, :], o.logits[:, -1, :]
+
+        def push(vec):
+            nonlocal emb, attn
+            emb = torch.cat([emb, vec.view(1, 1, -1)], 1)
+            attn = torch.cat([attn, torch.ones(1, 1, dtype=torch.long, device=dev)], 1)
+
+        plan_e = lambda i: self.plan_emb(torch.tensor([i], device=dev))[0]
+        text_e = lambda i: self.embed_tokens(torch.tensor([i], device=dev))[0]
+        for t in range(max_turns):
+            cur = {"plan": [], "resp": []}
+            push(plan_e(BOP_ID))
+            forced = force_plan(t) if force_plan is not None else None
+            finalize = False
+            if forced is not None:
+                for pid in forced:
+                    cur["plan"].append(int(pid)); push(plan_e(int(pid)))
+                cur["plan"].append(EOP_ID); push(plan_e(EOP_ID))
+            else:
+                for _ in range(max_plan):
+                    h, _lm = fwd()
+                    logits = self.planner(h).clone()
+                    logits[:, PAD_ID] = float("-inf")
+                    nxt = (int(torch.multinomial(F.softmax(logits / max(temp, 1e-6), -1), 1))
+                           if sample else int(logits.argmax(-1)))
+                    cur["plan"].append(nxt); push(plan_e(nxt))
+                    if nxt == FINALL_ID:
+                        finalize = True
+                        break
+                    if nxt == EOP_ID:
+                        break
+                else:
+                    cur["plan"].append(EOP_ID); push(plan_e(EOP_ID))
+            if finalize:                                       # planner chose global stop, no response
+                rec["turns"].append(cur)
+                if verbose:
+                    print(f"  [turn {t+1}] plan: {self._plan_dbg(cur['plan'])} FINALIZE_ALL (stop)")
+                return rec
+            for _ in range(max_resp):
+                _h, lm = fwd()
+                nxt = (int(torch.multinomial(F.softmax(lm / max(temp, 1e-6), -1), 1))
+                       if sample else int(lm.argmax(-1)))
+                cur["resp"].append(nxt); push(text_e(nxt))
+                if nxt == self.resp_eos_id:
+                    break
+            else:
+                cur["resp"].append(self.resp_eos_id); push(text_e(self.resp_eos_id))
+            rec["turns"].append(cur)
+            if verbose:
+                txt = self.tok.decode([i for i in cur["resp"] if i != self.resp_eos_id],
+                                      skip_special_tokens=True)
+                print(f"  [turn {t+1}] plan: {self._plan_dbg(cur['plan'])} EXEC | resp: {txt[:80]}")
+        return rec
+
+    def _plan_dbg(self, plan_ids):
+        """Human-readable plan token names for transparent logging (markers shown by name)."""
+        names = []
+        for i in plan_ids:
+            i = int(i)
+            names.append(ID2PLAN.get(i, f"<{i}>"))
+        return " ".join(names)
+
+    def interleaved_answer_text(self, rec):
+        """Decode the LAST turn's response prose tail (the gradeable commitment) from a run_interleaved
+        record. The terminal turn ends with 'FINAL ANSWER: X' under SFT supervision."""
+        if not rec["turns"]:
+            return ""
+        ids = [i for i in rec["turns"][-1]["resp"] if i != self.resp_eos_id]
+        return self.tok.decode(ids, skip_special_tokens=True)
 
 
 if __name__ == "__main__":
