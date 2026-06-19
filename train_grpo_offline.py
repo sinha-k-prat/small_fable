@@ -7,6 +7,14 @@ policy's per-token logprobs for the saved plan/response tokens, and minimizes th
 clipped objective from grpo_offpolicy.joint_grpo_loss:
 
     L = L_exec_clip + beta_plan * L_plan_clip + beta_ce * CE_plan_anchor
+        [+ kl_resp * KL(exec resp_new || SFT resp_old)   when --kl_resp > 0]
+
+The optional --kl_resp term anchors the FINAL ANSWER distribution to SFT. With --freeze_executor the
+LoRA is frozen, so the executor's SFT vs RL responses differ ONLY because the planner changed the plan
+prefix; this KL (k3, non-negative) penalizes that drift and is differentiable w.r.t. plan_emb (the soft
+plan prefix the frozen executor attends over), so it trains the planner to steer the executor without
+dragging its answers away from SFT. Reference = the cached behavior logp, which IS the SFT executor
+because rollouts are generated once from the SFT checkpoint.
 
 The crux is OFF-POLICY CORRECTION. We reuse each group for `inner_epochs` gradient steps; after
 step 1 the policy drifts from the saved behavior policy, so each token's gradient is scaled by
@@ -225,6 +233,12 @@ def main():
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--beta_plan", type=float, default=1.0)
     ap.add_argument("--beta_ce", type=float, default=0.1)
+    ap.add_argument("--kl_resp", type=float, default=0.0,
+                    help="KL-to-SFT anchor on RESPONSE tokens: kl_resp * KL(exec resp_new || SFT "
+                         "resp_old), k3 estimator (non-negative). Penalizes the planner for steering "
+                         "the (frozen) executor's answers away from the SFT response distribution. "
+                         "0 = off. Reference = cached behavior logp == SFT executor (rollouts come "
+                         "from the SFT ckpt). Differentiable w.r.t. plan_emb.")
     ap.add_argument("--lam_resp", type=float, default=1.0,
                     help="executor clipped-objective weight (forced to 0 by --freeze_executor)")
     ap.add_argument("--max_resp", type=int, default=64)
@@ -366,7 +380,7 @@ def main():
     for ie in range(start_ie, args.inner_epochs):
         model.train(); t0 = time.time()
         agg = {"total_loss": 0.0, "l_exec": 0.0, "exec_approx_kl": 0.0, "exec_clip_frac": 0.0,
-               "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "n": 0}
+               "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "kl_resp": 0.0, "n": 0}
         w_by_path = {"verifiable": [], "rubric": [], "judge": []}
         std_by_path = {"verifiable": [], "rubric": [], "judge": []}
         pqs = []
@@ -437,12 +451,23 @@ def main():
                 beta_plan=args.beta_plan, clip_eps=args.clip_eps, lam_resp=args.lam_resp,
                 ce_plan=ce_plan, beta_ce=args.beta_ce, adv_weights=adv_weights)
 
+            # KL-to-SFT anchor on response tokens (k3, non-negative). delta = resp_logp_new (grad,
+            # via plan_emb) - resp_logp_old (the cached SFT reference, constant). k3 pulls new->old
+            # from both sides, so the planner can't drag the frozen executor's answers off the SFT
+            # distribution. Clamp delta for exp() numerical safety.
+            if args.kl_resp > 0:
+                delta = (resp_logp_new - resp_logp_old).clamp(-10.0, 10.0)
+                k3 = torch.exp(-delta) - 1.0 + delta
+                kl_resp = (k3 * resp_mask).sum() / resp_mask.sum().clamp_min(1)
+                loss = loss + args.kl_resp * kl_resp
+                logs["kl_resp"] = float(kl_resp)
+
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             global_step += 1
             for k in ("total_loss", "l_exec", "exec_approx_kl", "exec_clip_frac",
-                      "plan_approx_kl", "zero_var_frac"):
+                      "plan_approx_kl", "zero_var_frac", "kl_resp"):
                 agg[k] += logs.get(k, 0.0)
             agg["n"] += 1
             if ckpt.due(global_step):
@@ -462,6 +487,7 @@ def main():
               f"loss={agg['total_loss']/n:.4f} l_exec={agg['l_exec']/n:.4f} "
               f"exec_approx_kl={ekl:.4f} exec_clip_frac={agg['exec_clip_frac']/n:.3f} "
               f"plan_approx_kl={agg['plan_approx_kl']/n:.4f} "
+              + (f"kl_resp(to-SFT)={agg['kl_resp']/n:.4f} " if args.kl_resp > 0 else "")
               + (f"held_reward={hr:.3f} " if hr is not None else "")
               + f"executor={'FROZEN' if args.freeze_executor else 'trainable'} "
               + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
