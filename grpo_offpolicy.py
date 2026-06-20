@@ -137,26 +137,24 @@ def joint_grpo_loss(
     exec_logp_new, exec_logp_old, exec_mask,
     plan_logp_new=None, plan_logp_old=None, plan_mask=None,
     beta_plan=1.0, clip_eps=0.2,
-    ce_plan=None, beta_ce=0.1, ce_resp=None, lam_resp=1.0,
+    ce_plan=None, beta_ce=0.1, lam_resp=1.0,
     adv_weights=None):
     """Full off-policy joint objective.
 
     Required:
-      rewards          (B,)   verifiable reward per trajectory (e.g. checker correctness,
-                              optionally + teacher-LL bonus so 'better than gold' is rewardable)
-      exec_logp_new/old (B,T_e) per-token logprobs of EXECUTOR tokens (response)
-      exec_mask         (B,T_e) 1 on executor/response tokens, 0 on prompt+plan+pad   <-- point (1)
+      rewards           (B,)   verifiable reward per trajectory
+      exec_logp_new/old (B,T_e) per-token logprobs of EXECUTOR tokens (response only)
+      exec_mask         (B,T_e) 1 on response tokens, 0 on prompt+plan+pad   <-- point (1)
     Optional plan policy (point (2)):
       plan_logp_new/old (B,T_p), plan_mask (B,T_p)
-    Optional CE anchors (keep SMALL per the doc: beta_ce 0.1):
-      ce_plan, ce_resp  scalars already reduced
+    Optional CE anchor (keep SMALL per the doc: beta_ce 0.1):
+      ce_plan           scalar already reduced
 
     Returns (total_loss, logs). MINIMIZE total_loss.
     """
     adv, zerovar = group_advantages(rewards, group_size)
     # A1/A1b: multiply the MaxEnt prompt weight onto the (group-normalized) advantage. The SAME
-    # per-trajectory weight scales BOTH policies' advantages, since it reflects how much signal
-    # the prompt's group carries — not anything policy-specific. None -> base behavior (no-op).
+    # per-trajectory weight scales BOTH policies' advantages. None -> no-op.
     if adv_weights is not None:
         adv = adv * adv_weights
         logs_w = {"adv_weight_mean": adv_weights.mean().item(),
@@ -178,9 +176,6 @@ def joint_grpo_loss(
     if ce_plan is not None:
         total = total + beta_ce * ce_plan
         logs["ce_plan"] = float(ce_plan)
-    if ce_resp is not None:
-        total = total + 0.0  # ce_resp folded into lam_resp path if you use it; kept explicit
-        logs["ce_resp"] = float(ce_resp)
 
     logs["total_loss"] = float(total.detach())
     logs["l_exec"] = float(l_exec.detach())

@@ -2,24 +2,20 @@
 """
 model_joint.py — the two-head adaptive agent (planner head + shared executor backbone).
 
-This is the load-bearing wiring for the whole pipeline. It started from the reference stub
-in the handoff and is fleshed out with the actual forward / rollout / scoring methods that
-train_sft.py, rollout_offline.py and train_grpo_offline.py call.
-
 ARCHITECTURE
 ------------
   backbone   : Qwen2.5-1.5B-Instruct (the "executor"), wrapped with LoRA on ALL 7 matrices.
-  planner    : a small linear head over the backbone's last-layer hidden states that emits
-               PLAN PRIMITIVE logits over a SEPARATE small vocabulary (PLAN_VOCAB), NOT the
-               executor token vocab. The planner is autoregressive: it is run step by step,
-               re-feeding each chosen primitive as a learned plan embedding.
+  planner    : a small 2-layer MLP head (hidden -> hidden//4 -> n_plan, SiLU) over the backbone's
+               last-layer hidden states that emits PLAN PRIMITIVE logits over a SEPARATE small
+               vocabulary (PLAN_VOCAB), NOT the executor token vocab. The planner is autoregressive:
+               it is run step by step, re-feeding each chosen primitive as a learned plan embedding.
   plan_emb   : embeddings for plan primitives. The chosen plan is embedded and prepended as a
                SOFT PREFIX (vectors in hidden space) so the executor is conditioned on the plan
                before it writes the answer.  -> "plan in planning mode, then answer".
 
 TWO POLICIES, KEPT SEPARATE EVERYWHERE
-  planner policy  -> action space = PLAN_VOCAB (41 primitives)   -> plan logprobs
-  executor policy -> action space = token vocab                  -> response logprobs
+  planner policy  -> action space = PLAN_VOCAB (factored primitives + key=value atoms + END)
+  executor policy -> action space = token vocab
 RL uses two INDEPENDENT clipped objectives over these (see grpo_offpolicy.joint_grpo_loss).
 
 PADDING CONVENTION (important for the tensor math)
@@ -27,12 +23,25 @@ PADDING CONVENTION (important for the tensor math)
   and the plan-prefix / response embeddings appended after it are contiguous. RoPE is relative,
   so a constant left shift of an example's positions is harmless. This lets every "predict the
   next k things" slice be a simple `[:, -k:, :]` with no per-example index gather.
+
+DTYPE
+  Pass dtype=torch.bfloat16 on CUDA (A100/H100) for 2x speed with full stability.
+  Default is torch.float32 on CPU, torch.bfloat16 on CUDA. Override via --dtype or dtype=.
+  The planner head and plan_emb are cast to the same dtype as the backbone so no mixed-precision
+  matmul errors occur.
+
+SELF-CONTAINED CHECKPOINTS
+  model.save(out_dir, base) always writes plan_vocab.json into out_dir alongside heads.pt.
+  from_checkpoint verifies that the loaded vocabulary matches the planner head's output dimension.
+  This makes every checkpoint independently reloadable without relying on an ambient plan_vocab.json.
 """
 import os, json
 import torch, torch.nn as nn
 import torch.nn.functional as F
 
 LORA_TARGETS = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]  # all 7
+
+_VOCAB_FILE_NAME = "plan_vocab.json"
 
 # Plan primitive vocabulary. Parameterized ops (FILTER[even], TOP_K[k=3]) collapse to their
 # base primitive via split("[") so the planner head stays a fixed, separate action space.
@@ -42,35 +51,62 @@ _DEFAULT_PLAN_VOCAB = ["PAD","EXTRACT","DECOMPOSE","MODEL","IDENTIFY_UNKNOWN","O
     "VERIFY_CONSISTENCY","VERIFY_STEP","VERIFY_EVIDENCE","REFLECT","EVAL","REFINE","CORRECT",
     "REPAIR","EXPAND","SIMPLIFY","MERGE","COMBINE","GENERALIZE","RESOLVE_CONFLICT","PLAN",
     "PLAN_NEXT","SELECT","CLARIFY","ADAPT","TERMINATE"]
+_DEFAULT_TERM_NAME = "TERMINATE"
 
 # A run can override the planner's action space + terminator via plan_vocab.json (written by
 # traces_to_sft.py). MUST be the same file at train and inference time (the planner head is sized to
 # it). Absent -> the default vocab above, so existing tests/synthetic data are unaffected.
 _VOCAB_FILE = os.environ.get("PLAN_VOCAB_FILE",
-                             os.path.join(os.path.dirname(os.path.abspath(__file__)), "plan_vocab.json"))
+                             os.path.join(os.path.dirname(os.path.abspath(__file__)), _VOCAB_FILE_NAME))
 if os.path.exists(_VOCAB_FILE):
     _vc = json.load(open(_VOCAB_FILE))
-    PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", "TERMINATE")
+    PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", _DEFAULT_TERM_NAME)
 else:
-    PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = "TERMINATE"
+    PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = _DEFAULT_TERM_NAME
 PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
 ID2PLAN = {i:p for p,i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
-# Terminator is matched by BASE name, so every parameterized variant (e.g. FINALIZE[form=yes_no],
-# FINALIZE[form=number_with_units]) ends a plan. TERM_ID keeps a single representative for legacy use.
+# Terminator matched by BASE name so every parameterized variant (FINALIZE[form=yes_no],
+# FINALIZE[form=number_with_units], …) ends a plan. TERM_ID is a single representative for legacy.
 _TERM_BASE = _TERM_NAME.split("[")[0]
 TERM_IDS = {i for p, i in PLAN2ID.items() if p.split("[")[0] == _TERM_BASE}
-TERM_ID = min(TERM_IDS) if TERM_IDS else len(PLAN_VOCAB) - 1
-N_PLAN  = len(PLAN_VOCAB)
+TERM_ID  = min(TERM_IDS) if TERM_IDS else len(PLAN_VOCAB) - 1
+N_PLAN   = len(PLAN_VOCAB)
+
+# Cached tensor for vectorised terminator membership test (filled on first GPU call).
+_TERM_IDS_TENSOR: torch.Tensor | None = None
+
+
+def _is_terminator(nxt: torch.Tensor) -> torch.Tensor:
+    """(B,) bool — True where nxt ∈ TERM_IDS.  Vectorised; tensor is cached per device."""
+    global _TERM_IDS_TENSOR
+    if _TERM_IDS_TENSOR is None or _TERM_IDS_TENSOR.device != nxt.device:
+        _TERM_IDS_TENSOR = torch.tensor(sorted(TERM_IDS), dtype=torch.long, device=nxt.device)
+    return nxt.unsqueeze(1).eq(_TERM_IDS_TENSOR).any(1)
+
+
+def save_vocab(out_dir: str) -> None:
+    """Write the current module-level plan vocabulary into out_dir/plan_vocab.json.
+    Called by JointModel.save() so every checkpoint is self-contained."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, _VOCAB_FILE_NAME)
+    with open(path, "w") as f:
+        json.dump({"vocab": PLAN_VOCAB, "terminator": _TERM_NAME}, f, indent=2)
+
+
+def _resolve_dtype(dtype, device: str) -> torch.dtype:
+    """Return dtype, defaulting to bfloat16 on CUDA (A100/H100 native), float32 on CPU."""
+    if dtype is not None:
+        return dtype
+    return torch.bfloat16 if (device != "cpu" and torch.cuda.is_available()) else torch.float32
 
 
 def build_lora(base_model, r=16, alpha=32, dropout=0.05, is_trainable=True):
     """Wrap a base causal LM with LoRA on all 7 projection matrices.
 
-    GUARD (the bug that made RL a silent no-op): PeftModel.from_pretrained loads adapters
-    FROZEN. If is_trainable is not forced on, 0 LoRA tensors require grad and RL becomes a
-    no-op (SFT and SFT+RL produce byte-identical outputs). We force requires_grad and assert
-    the count is > 0, printing it so the operator can eyeball ~336 (=14 per layer * n_layers)."""
+    GUARD: PeftModel.from_pretrained loads adapters FROZEN. If is_trainable is not forced on,
+    0 LoRA tensors require grad and RL becomes a no-op (SFT and SFT+RL produce byte-identical
+    outputs). We force requires_grad and assert the count is > 0."""
     from peft import LoraConfig, get_peft_model
     cfg = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, bias="none",
                      target_modules=LORA_TARGETS, task_type="CAUSAL_LM")
@@ -85,9 +121,6 @@ def _force_lora_trainable(model, is_trainable):
             if "lora_" in n:
                 p.requires_grad = True
     n_train = sum(1 for n, p in model.named_parameters() if p.requires_grad and "lora_" in n)
-    # The frozen-backbone GUARD only applies when we INTEND to train (RL/SFT): PeftModel.from_pretrained
-    # loads adapters frozen, so a silent 0 here would make RL a no-op. For inference/rollout loads
-    # (is_trainable=False) 0 trainable tensors is correct and expected — don't assert.
     if is_trainable:
         assert n_train > 0, ("FROZEN-BACKBONE BUG: 0 trainable LoRA tensors. "
                              "Pass is_trainable=True to from_pretrained / build_lora.")
@@ -97,14 +130,23 @@ def _force_lora_trainable(model, is_trainable):
 
 
 class PlannerHead(nn.Module):
-    """Projects backbone hidden states -> plan-primitive logits.
+    """2-layer MLP: hidden -> hidden//4 (SiLU) -> n_plan.
 
-    Generalized from the reference (which only read the last token): forward accepts
-    (B,T,H) and returns (B,T,N_PLAN) so we can score a whole teacher-forced plan in one pass.
-    Use `[..., -1, :]` when you only want the next-primitive distribution at the last step."""
+    The hidden//4 bottleneck gives the planner dedicated non-linear capacity to compose plan
+    sequences without relying solely on the shared backbone's hidden states. The forward
+    accepts (B,T,H) and returns (B,T,N_PLAN) for teacher-forced scoring over full plan seqs;
+    use `[..., -1, :]` when you need only the next-primitive distribution at the last step.
+
+    Backwards-compat loading: old checkpoints contain a single nn.Linear (keys proj.weight /
+    proj.bias). from_checkpoint transplants those weights into proj[2] automatically."""
     def __init__(self, hidden, n_plan=N_PLAN):
         super().__init__()
-        self.proj = nn.Linear(hidden, n_plan)
+        self.proj = nn.Sequential(
+            nn.Linear(hidden, hidden // 4),
+            nn.SiLU(),
+            nn.Linear(hidden // 4, n_plan),
+        )
+
     def forward(self, hidden_states):            # (B,T,H) -> (B,T,N_PLAN)
         return self.proj(hidden_states)
 
@@ -143,7 +185,7 @@ class JointModel(nn.Module):
 
     Two construction paths:
       from_base(...)       fresh adapter + heads for SFT.
-      from_checkpoint(...) load adapter + heads; pass is_trainable=True for RL (frozen-backbone guard).
+      from_checkpoint(...) load adapter + heads; pass is_trainable=True for RL.
     """
     def __init__(self, backbone, tokenizer, hidden, plan_max_len=12):
         super().__init__()
@@ -163,21 +205,21 @@ class JointModel(nn.Module):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
-        # Force fp32: the planner head + plan embeddings (the soft prefix) are fp32, so the backbone
-        # MUST be fp32 too or the prefix matmul mixes Float/BFloat16 (Qwen ships bf16). CPU bf16 is
-        # also flaky, and T4 has no fast bf16 — fp32 is the correct, stable default on every device.
-        if dtype is None:
-            dtype = torch.float32
+        dtype = _resolve_dtype(dtype, device)
         base = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=dtype)
         backbone = build_lora(base, r=r, alpha=alpha, dropout=dropout, is_trainable=True)
         hidden = base.config.hidden_size
         m = cls(backbone, tok, hidden, plan_max_len)
-        return m.to(device)
+        return m.to(device=device, dtype=dtype)
 
     @classmethod
     def from_checkpoint(cls, base_name, ckpt_dir, device="cpu", dtype=None,
                         is_trainable=False, plan_max_len=None):
-        """Load adapter + heads. For RL you MUST pass is_trainable=True or RL is a no-op."""
+        """Load adapter + heads. For RL you MUST pass is_trainable=True or RL is a no-op.
+
+        Verifies that the vocabulary in PLAN_VOCAB matches the planner head's output dimension.
+        If the checkpoint contains its own plan_vocab.json (all new checkpoints do), it is compared
+        to the module-level vocab and a clear error is raised on mismatch."""
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
         cfg = {}
@@ -191,18 +233,42 @@ class JointModel(nn.Module):
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
         tok.padding_side = "left"
-        if dtype is None:                       # fp32 everywhere — keep backbone dtype == fp32 heads
-            dtype = torch.float32
+        dtype = _resolve_dtype(dtype, device)
         base = AutoModelForCausalLM.from_pretrained(base_name, torch_dtype=dtype)
         backbone = PeftModel.from_pretrained(base, ckpt_dir, is_trainable=is_trainable)
-        # frozen-backbone GUARD: re-assert trainability matches intent.
         _force_lora_trainable(backbone, is_trainable)
         hidden = base.config.hidden_size
         m = cls(backbone, tok, hidden, plan_max_len)
-        heads = torch.load(os.path.join(ckpt_dir, "heads.pt"), map_location="cpu")
-        m.planner.load_state_dict(heads["planner"])
+
+        heads_path = os.path.join(ckpt_dir, "heads.pt")
+        heads = torch.load(heads_path, map_location="cpu")
+
+        # --- load planner head with backwards compat for old single-Linear checkpoints ---
+        try:
+            m.planner.load_state_dict(heads["planner"])
+        except RuntimeError:
+            if "proj.weight" in heads["planner"]:
+                # Old checkpoint: single nn.Linear with keys proj.weight / proj.bias.
+                # Transplant into the new MLP's final layer (proj[2]) so inference still works.
+                m.planner.proj[2].weight.data.copy_(heads["planner"]["proj.weight"])
+                m.planner.proj[2].bias.data.copy_(heads["planner"]["proj.bias"])
+                print("[model_joint] compat: loaded old single-Linear planner head into MLP proj[2]")
+            else:
+                raise
+
         m.plan_emb.load_state_dict(heads["plan_emb"])
-        return m.to(device)
+
+        # --- vocab size guard: checkpoint planner head must match current PLAN_VOCAB ---
+        head_out = m.planner.proj[-1].out_features
+        if head_out != N_PLAN:
+            ckpt_vocab_path = os.path.join(ckpt_dir, _VOCAB_FILE_NAME)
+            hint = (f"Set PLAN_VOCAB_FILE={ckpt_vocab_path} before importing model_joint, "
+                    "or load via the checkpoint's plan_vocab.json.")
+            raise RuntimeError(
+                f"Plan vocab size mismatch: checkpoint planner head has {head_out} outputs "
+                f"but current PLAN_VOCAB has {N_PLAN} tokens. {hint}")
+
+        return m.to(device=device, dtype=dtype)
 
     def save(self, out_dir, base_name):
         os.makedirs(out_dir, exist_ok=True)
@@ -213,6 +279,8 @@ class JointModel(nn.Module):
                    os.path.join(out_dir, "heads.pt"))
         json.dump({"base": base_name, "plan_max_len": self.plan_max_len, "hidden": self.hidden},
                   open(os.path.join(out_dir, "joint_config.json"), "w"), indent=2)
+        # Always write the vocabulary so the checkpoint is self-contained.
+        save_vocab(out_dir)
 
     # ---- low-level helpers ---------------------------------------------------
     @property
@@ -227,8 +295,7 @@ class JointModel(nn.Module):
                    if p.requires_grad and "lora_" in n)
 
     def encode_prompt(self, instruction):
-        """Chat-templated prompt text. Uses the tokenizer's template; falls back to the standard
-        Qwen ChatML format if the installed jinja2 is too old for apply_chat_template."""
+        """Chat-templated prompt text."""
         msgs = [{"role": "user", "content": instruction}]
         try:
             return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -271,7 +338,7 @@ class JointModel(nn.Module):
     @torch.no_grad()
     def sample_plan(self, prompt_ids, prompt_attn, temp=1.0, sample=True, max_len=None):
         """Autoregressively roll out a plan. Returns plan_ids (B, max_len) padded with PAD,
-        stopping each sequence after it emits TERMINATE. PAD is masked out at sampling time."""
+        stopping each sequence after it emits a terminator token. Uses vectorised terminator check."""
         max_len = max_len or self.plan_max_len
         B = prompt_ids.size(0)
         p_emb = self.embed_tokens(prompt_ids)
@@ -290,13 +357,30 @@ class JointModel(nn.Module):
                 nxt = logits.argmax(-1)
             nxt = torch.where(done, torch.full_like(nxt, PAD_ID), nxt)
             plan[:, t] = nxt
-            is_term = sum((nxt == tid) for tid in TERM_IDS) > 0   # any FINALIZE[...] variant ends the plan
-            done = done | is_term
+            done = done | _is_terminator(nxt)                           # vectorised check
             if done.all():
                 break
             step_emb = self.plan_emb(nxt.clamp_min(0)).unsqueeze(1)     # (B,1,H)
             cur_emb = torch.cat([cur_emb, step_emb], dim=1)
             cur_attn = torch.cat([cur_attn, (~done).long().unsqueeze(1)], dim=1)
+        return plan
+
+    @torch.no_grad()
+    def sample_random_plan(self, prompt_ids, max_len=None):
+        """Sample a plan by drawing tokens uniformly from non-PAD plan vocab (no backbone call).
+        Used for the random-plan ablation: proves the CONTENT of a plan matters, not just its
+        presence as a soft prefix. Each sequence stops after the first terminator token."""
+        import random as _random
+        max_len = max_len or self.plan_max_len
+        B = prompt_ids.size(0)
+        non_pad = [i for i in range(N_PLAN) if i != PAD_ID]
+        plan = torch.full((B, max_len), PAD_ID, dtype=torch.long, device=self.device)
+        for b in range(B):
+            for t in range(max_len):
+                tok = _random.choice(non_pad)
+                plan[b, t] = tok
+                if tok in TERM_IDS:
+                    break
         return plan
 
     # ---- EXECUTOR policy -----------------------------------------------------
@@ -328,8 +412,7 @@ class JointModel(nn.Module):
 
     def resp_logp_tf(self, prompt_ids, prompt_attn, plan_ids, resp_ids, resp_attn, temp=1.0):
         """Per-token logprob of the response under the executor policy. Returns logp (B,R),
-        mask (B,R). Note: this is EXECUTOR (response) tokens only — prompt and plan are never
-        in this tensor, satisfying grpo_offpolicy's executor-only masking requirement."""
+        mask (B,R). EXECUTOR tokens only — prompt and plan are never in this tensor."""
         logits = self.executor_logits_tf(prompt_ids, prompt_attn, plan_ids, resp_ids, resp_attn) / temp
         logp_all = F.log_softmax(logits, dim=-1)
         logp = logp_all.gather(-1, resp_ids.unsqueeze(-1)).squeeze(-1)
@@ -340,7 +423,8 @@ class JointModel(nn.Module):
     def generate_answer(self, prompt_ids, prompt_attn, plan_ids, temp=1.0, sample=True,
                         max_new_tokens=64, top_p=0.95):
         """Sample/greedy-decode an answer conditioned on the plan prefix (soft-prefix embeds).
-        Returns generated token ids (B, gen_len) — new tokens only (inputs_embeds path)."""
+        Returns generated token ids (B, gen_len) — new tokens only (inputs_embeds path,
+        transformers>=4.51)."""
         inp, attn, _ = self._plan_prefix(prompt_ids, prompt_attn, plan_ids)
         gen = self.backbone.generate(
             inputs_embeds=inp, attention_mask=attn,
@@ -363,5 +447,9 @@ if __name__ == "__main__":
     assert PLAN2ID["EVAL"] > 0
     assert decode_plan(encode_plan(["EXTRACT","TERMINATE"])) == ["EXTRACT","TERMINATE"]
     assert PLAN2ID.get("FILTER", PAD_ID) == PAD_ID  # FILTER[even] base collapses to PAD if absent
-    print("model_joint smoke: plan vocab OK, encode/decode OK")
+    # terminator vectorised check
+    nxt = torch.tensor([TERM_ID, 0, TERM_ID])
+    expected = torch.tensor([True, False, True])
+    assert (_is_terminator(nxt) == expected).all(), "_is_terminator failed"
+    print("model_joint smoke: plan vocab OK, encode/decode OK, _is_terminator OK")
     print(f"plan vocab size: {N_PLAN} | LoRA targets: {LORA_TARGETS}")

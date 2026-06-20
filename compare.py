@@ -37,8 +37,14 @@ def load_data(path, train, held):
 
 @torch.no_grad()
 def eval_joint(model, held, max_resp, sample, temp, group):
+    """Three-way ablation: gold plan vs random plan vs no plan.
+
+    gap_content  = acc_gold - acc_random  proves plan CONTENT matters (not just its presence)
+    gap_presence = acc_random - acc_noplan proves the soft prefix itself helps
+    ablation_gap = acc_gold - acc_noplan   overall (backwards compat)
+    """
     model.eval()
-    corr_sampled = corr_plan = corr_noplan = 0
+    corr_sampled = corr_plan = corr_rand = corr_noplan = 0
     rew_means, zero_var = [], 0
     plan_counter = Counter()
     for r in held:
@@ -48,30 +54,43 @@ def eval_joint(model, held, max_resp, sample, temp, group):
         plan_counter.update(model_decode_plan(plan))
         gen = model.generate_answer(p_ids, p_attn, plan, sample=sample, temp=temp, max_new_tokens=max_resp)
         corr_sampled += reward_for_row(r, model.tok.decode(gen[0], skip_special_tokens=True))
-        # ablation: gold plan vs no plan
+        # ablation: gold plan vs random plan (uniform, no backbone) vs no plan
         gold_plan = encode_plan(r["plan"], model.plan_max_len).unsqueeze(0).to(model.device)
-        g_plan = model.generate_answer(p_ids, p_attn, gold_plan, sample=sample, temp=temp, max_new_tokens=max_resp)
-        g_none = model.generate_answer(p_ids, p_attn, None, sample=sample, temp=temp, max_new_tokens=max_resp)
-        corr_plan += reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
+        rand_plan = model.sample_random_plan(p_ids, max_len=model.plan_max_len)
+        g_plan = model.generate_answer(p_ids, p_attn, gold_plan, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        g_rand = model.generate_answer(p_ids, p_attn, rand_plan, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        g_none = model.generate_answer(p_ids, p_attn, None, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        corr_plan   += reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
+        corr_rand   += reward_for_row(r, model.tok.decode(g_rand[0], skip_special_tokens=True))
         corr_noplan += reward_for_row(r, model.tok.decode(g_none[0], skip_special_tokens=True))
         # G-sample group for reward variance
         pe_ids, pe_attn = model.batch_prompts([r["instruction"]] * group)
         gp = model.sample_plan(pe_ids, pe_attn, temp=max(temp, 1.3), sample=True)
-        gg = model.generate_answer(pe_ids, pe_attn, gp, sample=True, temp=max(temp, 1.3), max_new_tokens=max_resp)
+        gg = model.generate_answer(pe_ids, pe_attn, gp, sample=True, temp=max(temp, 1.3),
+                                   max_new_tokens=max_resp)
         rews = torch.tensor([reward_for_row(r, model.tok.decode(gg[i], skip_special_tokens=True))
                              for i in range(group)], dtype=torch.float)
         rew_means.append(float(rews.mean()))
         if float(rews.std(unbiased=False)) < 1e-6:
             zero_var += 1
     n = len(held)
+    acc_gold = corr_plan / n
+    acc_rand = corr_rand / n
+    acc_none = corr_noplan / n
     return {
-        "acc_sampled": corr_sampled/n,
-        "acc_gold_plan": corr_plan/n,
-        "acc_no_plan": corr_noplan/n,
-        "ablation_gap": (corr_plan - corr_noplan)/n,
-        "mean_reward": sum(rew_means)/n,
-        "zero_var_frac": zero_var/n,
-        "plan_dist": dict(plan_counter.most_common(10)),
+        "acc_sampled":     corr_sampled / n,
+        "acc_gold_plan":   acc_gold,
+        "acc_random_plan": acc_rand,
+        "acc_no_plan":     acc_none,
+        "gap_content":     acc_gold - acc_rand,   # plan content load-bearing
+        "gap_presence":    acc_rand - acc_none,   # soft prefix itself helps
+        "ablation_gap":    acc_gold - acc_none,   # overall (backwards compat)
+        "mean_reward":     sum(rew_means) / n,
+        "zero_var_frac":   zero_var / n,
+        "plan_dist":       dict(plan_counter.most_common(10)),
     }
 
 
@@ -180,7 +199,13 @@ def main():
     ap.add_argument("--clr_k", type=int, default=4, help="A8 trajectories sampled per prompt")
     ap.add_argument("--clr_m", type=int, default=2, help="A8 nonlinearity: (mean_verdict)^M")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default=None,
+                    help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA)")
     args = ap.parse_args()
+
+    _dtype = None
+    if args.dtype and args.dtype != "auto":
+        _dtype = getattr(torch, args.dtype)
     if not args.sample:
         print("[compare] WARNING: --sample not set. Greedy decoding hides small RL effects.")
 
@@ -193,14 +218,16 @@ def main():
     print(json.dumps(report["base"], indent=2), "\n")
 
     print("=== SFT ===")
-    msft = JointModel.from_checkpoint(args.base, args.sft_ckpt, device=args.device, is_trainable=False)
+    msft = JointModel.from_checkpoint(args.base, args.sft_ckpt, device=args.device,
+                                      dtype=_dtype, is_trainable=False)
     report["sft"] = eval_joint(msft, held, args.max_resp, args.sample, args.temp, args.group)
     sft_plan_dist = report["sft"]["plan_dist"]
     del msft
     print(json.dumps(report["sft"], indent=2), "\n")
 
     print("=== SFT+RL ===")
-    mrl = JointModel.from_checkpoint(args.base, args.rl_ckpt, device=args.device, is_trainable=False)
+    mrl = JointModel.from_checkpoint(args.base, args.rl_ckpt, device=args.device,
+                                     dtype=_dtype, is_trainable=False)
     report["rl"] = eval_joint(mrl, held, args.max_resp, args.sample, args.temp, args.group)
     rl_plan_dist = report["rl"]["plan_dist"]
     # OOD generations (qualitative)
@@ -229,8 +256,13 @@ def main():
     print(f"\nacc: base={report['base']['acc_sampled']:.3f} "
           f"sft={report['sft']['acc_sampled']:.3f} rl={report['rl']['acc_sampled']:.3f}")
     print(f"ablation_gap: sft={report['sft']['ablation_gap']:+.3f} rl={report['rl']['ablation_gap']:+.3f}")
+    print(f"gap_content (gold-random): sft={report['sft']['gap_content']:+.3f} "
+          f"rl={report['rl']['gap_content']:+.3f}  (>0 proves plan CONTENT matters)")
+    print(f"gap_presence (random-none): sft={report['sft']['gap_presence']:+.3f} "
+          f"rl={report['rl']['gap_presence']:+.3f}  (>0 proves soft prefix itself helps)")
     print(f"mean_reward: sft={report['sft']['mean_reward']:.3f} rl={report['rl']['mean_reward']:.3f}")
-    print("\nACCEPTANCE: SFT+RL ≠ SFT under sampling, adapter L2 diff > 0, ablation_gap positive.")
+    print("\nACCEPTANCE: SFT+RL ≠ SFT under sampling, adapter L2 diff > 0, ablation_gap positive, "
+          "gap_content positive (plan content is load-bearing, not just a warm-up prefix).")
 
 
 if __name__ == "__main__":

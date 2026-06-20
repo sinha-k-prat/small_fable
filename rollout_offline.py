@@ -42,20 +42,15 @@ from reward_paths import reward_path_for_row
 
 
 def resp_mask_from_ids(ids, eos_id, pad_id):
-    """Build a 1/0 mask over generated ids: 1 up to and including the first eos, 0 after.
-    Returns (mask, trim_len) so callers can trim trailing all-pad columns."""
-    B, T = ids.shape
-    mask = torch.ones_like(ids, dtype=torch.float)
-    trim = 0
-    for b in range(B):
-        seen_eos = False
-        for t in range(T):
-            tok = int(ids[b, t])
-            if seen_eos:
-                mask[b, t] = 0.0
-            elif tok == eos_id:
-                seen_eos = True  # keep the eos itself as a real token
-            trim = max(trim, t + 1 if mask[b, t] > 0 else trim)
+    """Build a 1/0 mask over generated ids: 1 up to and including the first EOS, 0 after.
+    Vectorised: no Python loop over B*T. Returns (mask, trim_len)."""
+    eos_flags = (ids == eos_id).float()               # 1 exactly at EOS positions
+    # cumsum > 1 means we are strictly AFTER the first EOS token
+    after_eos = eos_flags.cumsum(dim=1) > 1.0
+    mask = (~after_eos).float()                        # 1 up to and including the first EOS
+    # trim: last column index where any row is still active, plus 1
+    active_cols = mask.any(dim=0).nonzero(as_tuple=False)
+    trim = int(active_cols[-1]) + 1 if len(active_cols) else 1
     return mask, max(trim, 1)
 
 
@@ -75,9 +70,15 @@ def main():
                     help="A2: mark zero-spread groups keep=False (no GRPO gradient)")
     ap.add_argument("--no-filter", dest="filter", action="store_false")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default=None,
+                    help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA, float32 on CPU)")
     ap.add_argument("--seed", type=int, default=20260616)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
+
+    _dtype = None
+    if args.dtype and args.dtype != "auto":
+        _dtype = getattr(torch, args.dtype)
 
     rows = [json.loads(l) for l in open(args.data)][:args.train]
     print(f"[rollout] {len(rows)} instructions x G={args.group} @ temp={args.temp}")
@@ -85,7 +86,7 @@ def main():
     # Load the SFT model. (Generation only -> trainability irrelevant here, but we keep the
     # frozen-backbone guard live downstream in train_grpo_offline.py.)
     model = JointModel.from_checkpoint(args.base, args.sft_ckpt, device=args.device,
-                                       is_trainable=False)
+                                       dtype=_dtype, is_trainable=False)
     model.eval()
     eos_id = model.tok.eos_token_id
     pad_id = model.tok.pad_token_id

@@ -5,8 +5,13 @@ train_sft.py — Stage 1: joint SFT of the planner head + executor backbone.
 Loss (teacher-forced):
     L = CE(plan_head, gold_plan) + lam_resp * CE(executor, gold_answer) + lam_kl * KL(executor || base)
 
-Diagnostic that matters most: the PLAN-VS-NO-PLAN ABLATION GAP — decode with the gold plan vs with
-NO plan, report the checker-correctness gap. Positive => the plan is LOAD-BEARING.
+Diagnostic that matters most: the PLAN-VS-NO-PLAN ABLATION GAP — three conditions:
+  - gold plan:   decode with the gold (teacher-forced) plan
+  - random plan: decode with a plan sampled uniformly from the plan vocab (no backbone call)
+  - no plan:     decode with no plan prefix at all
+  gap_content = acc_gold  - acc_random  -> proves the plan CONTENT matters, not just its presence
+  gap_presence = acc_random - acc_noplan -> proves the soft prefix itself helps
+Both should be positive. If only gap_presence > 0, the plan acts as a warm-up token, not strategy.
 
 ADDENDA
 -------
@@ -15,6 +20,8 @@ A3  Two-stage curriculum (broad -> hard), enabled with --curriculum:
       Stage 2 (hard reasoning): init from stage-1, train on a HARD SUBSET selected by the stage-1
               model itself (8 rollouts/prompt, keep error-rate >= 0.75 i.e. solved <= 2/8), ~2 epochs.
       Logs the held ablation gap after BOTH stages; expect it to GROW in stage 2.
+      Supports --resume: stage-2 hard ids are saved to {out}/curriculum_hard_ids.json so a
+      killed run can be resumed mid-stage-2 without re-running stage 1.
 A4  Spectrum-to-signal: data rows may carry >1 (plan, answer) via an "alternatives" list; we train
     on all of them so the post-SFT model samples DIVERSE rollouts (=> non-zero GRPO variance). After
     SFT we measure Pass@k and rollout PLAN DIVERSITY on a probe set; low diversity here PREDICTS
@@ -22,13 +29,22 @@ A4  Spectrum-to-signal: data rows may carry >1 (plan, answer) via an "alternativ
 Curriculum batching: batches are ordered EASY -> HARD by a difficulty proxy (plan length + answer
     length), with light intra-band shuffling to keep category coverage / stochasticity.
 
-Saves joint_ckpt/ = LoRA adapter + planner head + plan embeddings + tokenizer + joint_config.json.
+DATA SPLIT
+  Rows are SHUFFLED with a seeded RNG before splitting into train/held so the held set is
+  a representative random sample, not a positional slice (which can be biased if the data
+  has ordering structure).
+
+Saves joint_ckpt/ = LoRA adapter + planner head + plan embeddings + tokenizer + joint_config.json
+                    + plan_vocab.json (self-contained; no ambient plan_vocab.json needed to reload).
 
 CLI (single stage, base spec):
   python train_sft.py --data dataset/sft_100.jsonl --train 70 --held 30 --epochs 6 --device cuda
 CLI (A3 two-stage curriculum):
   python train_sft.py --data dataset/sft_flat.jsonl --train 800 --held 100 --curriculum \
       --stage1_epochs 5 --stage2_epochs 2 --lr 5e-5 --lr_min 8e-8 --device cuda
+CLI (A3 resume after kill):
+  python train_sft.py --data dataset/sft_flat.jsonl --train 800 --held 100 --curriculum \
+      --stage1_epochs 5 --stage2_epochs 2 --resume --device cuda
 """
 import argparse, json, math, os, random, time
 import torch, torch.nn.functional as F
@@ -38,6 +54,8 @@ from checkers import graded_reward_for_row
 from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
                            scalar_args)
 
+_HARD_IDS_FILE = "curriculum_hard_ids.json"
+
 
 # --------------------------------------------------------------------------- data
 def load_rows(path):
@@ -45,8 +63,7 @@ def load_rows(path):
 
 
 def expand_alternatives(rows):
-    """A4: expand a row with multiple (plan, answer) pairs into multiple training items, all sharing
-    the instruction + checker. Rows without 'alternatives' pass through unchanged."""
+    """A4: expand a row with multiple (plan, answer) pairs into multiple training items."""
     out = []
     for r in rows:
         alts = r.get("alternatives")
@@ -111,12 +128,22 @@ def resp_ce_and_kl(model, prompt_ids, prompt_attn, plan_ids, resp_ids, resp_attn
 # --------------------------------------------------------------------------- diagnostics
 @torch.no_grad()
 def eval_held(model, rows, max_resp, sample=False, temp=0.7):
-    """Held-out plan CE, answer CE, and the plan-vs-no-plan ablation gap."""
+    """Held-out plan CE, answer CE, and the three-way ablation gap.
+
+    Three decoding conditions:
+      gold plan   — the teacher-forced gold plan from the dataset
+      random plan — uniformly sampled from plan vocab (no backbone; tests content vs presence)
+      no plan     — zero soft prefix
+
+    gap_content  = acc_gold - acc_random  (plan content is load-bearing)
+    gap_presence = acc_random - acc_noplan (soft prefix itself helps)
+    ablation_gap = acc_gold - acc_noplan   (overall: retained for backwards compat)
+    """
     if not rows:
         return {}
     model.eval()
     pce_sum = rce_sum = 0.0
-    corr_plan = corr_noplan = 0.0
+    corr_plan = corr_randplan = corr_noplan = 0.0
     for r in rows:
         p_ids, p_attn = model.batch_prompts([r["instruction"]])
         plan_ids = encode_plan(r["plan"], model.plan_max_len).unsqueeze(0).to(model.device)
@@ -124,25 +151,37 @@ def eval_held(model, rows, max_resp, sample=False, temp=0.7):
         pce_sum += float(plan_ce(model, p_ids, p_attn, plan_ids))
         rce, _ = resp_ce_and_kl(model, p_ids, p_attn, plan_ids, r_ids, r_attn, 0.0)
         rce_sum += float(rce)
-        g_plan = model.generate_answer(p_ids, p_attn, plan_ids, sample=sample, temp=temp, max_new_tokens=max_resp)
-        g_none = model.generate_answer(p_ids, p_attn, None, sample=sample, temp=temp, max_new_tokens=max_resp)
-        corr_plan += graded_reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
-        corr_noplan += graded_reward_for_row(r, model.tok.decode(g_none[0], skip_special_tokens=True))
+        g_plan = model.generate_answer(p_ids, p_attn, plan_ids, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        rand_plan = model.sample_random_plan(p_ids, max_len=model.plan_max_len)
+        g_rand = model.generate_answer(p_ids, p_attn, rand_plan, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        g_none = model.generate_answer(p_ids, p_attn, None, sample=sample, temp=temp,
+                                       max_new_tokens=max_resp)
+        corr_plan    += graded_reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
+        corr_randplan += graded_reward_for_row(r, model.tok.decode(g_rand[0], skip_special_tokens=True))
+        corr_noplan  += graded_reward_for_row(r, model.tok.decode(g_none[0], skip_special_tokens=True))
     n = len(rows)
-    return {"plan_ce": pce_sum/n, "resp_ce": rce_sum/n, "acc_plan": corr_plan/n,
-            "acc_noplan": corr_noplan/n, "ablation_gap": (corr_plan - corr_noplan)/n}
+    acc_gold = corr_plan / n
+    acc_rand = corr_randplan / n
+    acc_none = corr_noplan / n
+    return {"plan_ce": pce_sum/n, "resp_ce": rce_sum/n,
+            "acc_gold_plan": acc_gold, "acc_random_plan": acc_rand, "acc_noplan": acc_none,
+            "gap_content":  acc_gold - acc_rand,   # plan CONTENT matters (not just presence)
+            "gap_presence": acc_rand - acc_none,   # soft prefix itself helps
+            "ablation_gap": acc_gold - acc_none}   # overall (backwards compat)
 
 
 @torch.no_grad()
 def probe_diversity(model, rows, group=8, max_resp=64, temp=1.0):
-    """A4: post-SFT rollout diversity + Pass@k on a probe set. distinct_plans/prompt > 1 predicts
-    non-zero GRPO variance; Pass@k is the spectrum's reach."""
+    """A4: post-SFT rollout diversity + Pass@k on a probe set."""
     model.eval()
     distinct, passk = [], 0
     for r in rows:
         p_ids, p_attn = model.batch_prompts([r["instruction"]] * group)
         plans = model.sample_plan(p_ids, p_attn, temp=max(temp, 1.3), sample=True)
-        gen = model.generate_answer(p_ids, p_attn, plans, sample=True, temp=max(temp, 1.3), max_new_tokens=max_resp)
+        gen = model.generate_answer(p_ids, p_attn, plans, sample=True, temp=max(temp, 1.3),
+                                    max_new_tokens=max_resp)
         plan_strs = {tuple(decode_plan(plans[i])) for i in range(group)}
         distinct.append(len(plan_strs))
         if any(graded_reward_for_row(r, model.tok.decode(gen[i], skip_special_tokens=True)) >= 0.5
@@ -154,15 +193,15 @@ def probe_diversity(model, rows, group=8, max_resp=64, temp=1.0):
 
 @torch.no_grad()
 def hard_subset(model, rows, samples=8, max_resp=64, temp=1.3, err_rate=0.75):
-    """A3 stage-2 filter (VibeThinker-style): keep prompts the CURRENT model rarely solves. A prompt
-    is 'solved' on a sample if reward >= 0.5; keep it if solved <= (1-err_rate)*samples."""
+    """A3 stage-2 filter: keep prompts the CURRENT model rarely solves."""
     model.eval()
     keep_max = math.floor((1 - err_rate) * samples)
     hard = []
     for r in rows:
         p_ids, p_attn = model.batch_prompts([r["instruction"]] * samples)
         plans = model.sample_plan(p_ids, p_attn, temp=temp, sample=True)
-        gen = model.generate_answer(p_ids, p_attn, plans, sample=True, temp=temp, max_new_tokens=max_resp)
+        gen = model.generate_answer(p_ids, p_attn, plans, sample=True, temp=temp,
+                                    max_new_tokens=max_resp)
         solved = sum(graded_reward_for_row(r, model.tok.decode(gen[i], skip_special_tokens=True)) >= 0.5
                      for i in range(samples))
         if solved <= keep_max:
@@ -171,9 +210,10 @@ def hard_subset(model, rows, samples=8, max_resp=64, temp=1.3, err_rate=0.75):
 
 
 # --------------------------------------------------------------------------- training
-def _sft_state(epoch, batch_idx, global_step, opt, sched, args):
+def _sft_state(epoch, batch_idx, global_step, opt, sched, args, stage=None):
     """Resume payload: position = next (epoch, batch_idx) to run."""
     return {"kind": "sft", "epoch": epoch, "batch_idx": batch_idx, "global_step": global_step,
+            "stage": stage,   # None = single-stage; 1 or 2 for curriculum
             "n_plan": N_PLAN, "optimizer": opt.state_dict(),
             "scheduler": (sched.state_dict() if sched is not None else None),
             "torch_rng": torch.get_rng_state(), "py_rng": random.getstate(),
@@ -181,23 +221,25 @@ def _sft_state(epoch, batch_idx, global_step, opt, sched, args):
 
 
 def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
-              ckpt=None, start_epoch=0, start_batch=0, global_step=0):
+              ckpt=None, start_epoch=0, start_batch=0, global_step=0, stage=None):
     held = {"ablation_gap": 0.0}
     for ep in range(start_epoch, epochs):
         model.train(); t0 = time.time()
         run = {"plan_ce": 0.0, "resp_ce": 0.0, "kl": 0.0, "n": 0}
         batches = list(curriculum_batches(stage_rows, args.bs, seed=args.seed + ep))
-        sb = start_batch if ep == start_epoch else 0   # mid-epoch resume only on the resumed epoch
+        sb = start_batch if ep == start_epoch else 0
         for bi in range(len(batches)):
             if bi < sb:
                 continue
             batch = batches[bi]
             instrs = [r["instruction"] for r in batch]
             p_ids, p_attn = model.batch_prompts(instrs)
-            plan_ids = torch.stack([encode_plan(r["plan"], model.plan_max_len) for r in batch]).to(model.device)
+            plan_ids = torch.stack([encode_plan(r["plan"], model.plan_max_len)
+                                    for r in batch]).to(model.device)
             r_ids, r_attn = tok_answer(model, [r["answer"] for r in batch], args.max_resp)
             l_plan = plan_ce(model, p_ids, p_attn, plan_ids)
-            l_resp, l_kl = resp_ce_and_kl(model, p_ids, p_attn, plan_ids, r_ids, r_attn, args.lam_kl)
+            l_resp, l_kl = resp_ce_and_kl(model, p_ids, p_attn, plan_ids, r_ids, r_attn,
+                                           args.lam_kl)
             loss = l_plan + args.lam_resp * l_resp + args.lam_kl * l_kl
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
@@ -208,22 +250,23 @@ def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
             run["plan_ce"] += float(l_plan); run["resp_ce"] += float(l_resp)
             run["kl"] += float(l_kl); run["n"] += 1
             if ckpt is not None and ckpt.due(global_step):
-                ckpt.save(model, _sft_state(ep, bi + 1, global_step, opt, sched, args),
+                ckpt.save(model, _sft_state(ep, bi + 1, global_step, opt, sched, args, stage),
                           reason=f"{tag}-e{ep+1}-b{bi+1}")
         n = max(run["n"], 1)
         held = eval_held(model, args._held_rows, args.max_resp, sample=args.eval_sample)
         print(f"[sft:{tag}] epoch {ep+1}/{epochs} ({time.time()-t0:.1f}s) "
               f"plan_ce={run['plan_ce']/n:.4f} resp_ce={run['resp_ce']/n:.4f} kl={run['kl']/n:.4f} "
               f"| held {json.dumps(held)}")
-        if getattr(args, "metrics_out", None):   # per-epoch row for the loss table
+        if getattr(args, "metrics_out", None):
             rec = {"tag": tag, "epoch": ep + 1, "time_s": round(time.time() - t0, 1),
-                   "train_plan_ce": round(run["plan_ce"]/n, 4), "train_resp_ce": round(run["resp_ce"]/n, 4),
+                   "train_plan_ce": round(run["plan_ce"]/n, 4),
+                   "train_resp_ce": round(run["resp_ce"]/n, 4),
                    "kl": round(run["kl"]/n, 4),
                    **{f"held_{k}": round(v, 4) for k, v in held.items()}}
             with open(args.metrics_out, "a") as mf:
                 mf.write(json.dumps(rec) + "\n")
-        if ckpt is not None:   # end-of-epoch checkpoint: next position = (ep+1, 0)
-            ckpt.save(model, _sft_state(ep + 1, 0, global_step, opt, sched, args),
+        if ckpt is not None:
+            ckpt.save(model, _sft_state(ep + 1, 0, global_step, opt, sched, args, stage),
                       reason=f"{tag}-epoch{ep+1}")
     return held or {"ablation_gap": 0.0}
 
@@ -234,10 +277,8 @@ def make_opt_sched(model, lr, lr_min, total_steps, warmup_frac):
     try:
         from transformers import get_cosine_schedule_with_warmup
         warmup = max(1, int(warmup_frac * total_steps))
-        # cosine from lr down toward lr_min: implement min-lr via a floor lambda
         floor = lr_min / lr
         base = get_cosine_schedule_with_warmup(opt, warmup, total_steps)
-        # wrap so the LR never decays below lr_min
         orig = base.lr_lambdas[0]
         base.lr_lambdas[0] = (lambda step, _o=orig, _f=floor: max(_f, _o(step)))
         sched = base
@@ -263,65 +304,117 @@ def main():
     ap.add_argument("--plan_max_len", type=int, default=12)
     ap.add_argument("--out", default="joint_ckpt")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default=None,
+                    help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA, float32 on CPU)")
     ap.add_argument("--seed", type=int, default=20260616)
     ap.add_argument("--eval_sample", action="store_true")
     # A3 curriculum
     ap.add_argument("--curriculum", action="store_true", help="A3: two-stage broad->hard")
     ap.add_argument("--stage1_epochs", type=int, default=5)
     ap.add_argument("--stage2_epochs", type=int, default=2)
-    ap.add_argument("--hard_err_rate", type=float, default=0.75, help="A3 keep prompts solved<=(1-this)*S")
+    ap.add_argument("--hard_err_rate", type=float, default=0.75)
     ap.add_argument("--hard_samples", type=int, default=8)
     ap.add_argument("--stage1_out", default=None, help="optional path to save the stage-1 checkpoint")
     # A4 probe
     ap.add_argument("--probe", type=int, default=16, help="probe set size for diversity/Pass@k (0=skip)")
-    # checkpoint / resume (single-stage only)
-    ap.add_argument("--ckpt_every_min", type=float, default=0.0,
-                    help="periodic checkpoint interval in minutes (0 = only at epoch boundaries)")
-    ap.add_argument("--ckpt_every_steps", type=int, default=0,
-                    help="periodic checkpoint every N optimizer steps (0 = off)")
-    ap.add_argument("--hf_repo", default=None,
-                    help="push each checkpoint to this HF model repo (e.g. user/small_fable-planner)")
+    # checkpoint / resume
+    ap.add_argument("--ckpt_every_min", type=float, default=0.0)
+    ap.add_argument("--ckpt_every_steps", type=int, default=0)
+    ap.add_argument("--hf_repo", default=None)
     ap.add_argument("--resume", action="store_true",
-                    help="resume from --out if it contains a train_state.pt (single-stage only)")
-    ap.add_argument("--metrics_out", default="sft_metrics.jsonl",
-                    help="append per-epoch train/held metrics here (for the loss table)")
+                    help="resume from --out if it contains a train_state.pt")
+    ap.add_argument("--metrics_out", default="sft_metrics.jsonl")
     args = ap.parse_args()
     random.seed(args.seed); torch.manual_seed(args.seed)
 
+    # resolve dtype
+    _dtype = None
+    if args.dtype and args.dtype != "auto":
+        _dtype = getattr(torch, args.dtype)
+
     rows = load_rows(args.data)
+    # Seeded shuffle BEFORE split so held is a representative random sample, not a positional slice.
+    random.Random(args.seed).shuffle(rows)
     assert len(rows) >= args.train + args.held, "not enough rows for the requested train/held split"
     train_rows = expand_alternatives(rows[:args.train])           # A4
-    held_rows = rows[args.train:args.train+args.held]
+    held_rows  = rows[args.train:args.train+args.held]
     probe_rows = held_rows[:args.probe] if args.probe else []
     args._held_rows = held_rows
     print(f"[sft] data={args.data} train={len(train_rows)} (expanded) held={len(held_rows)} base={args.base}")
 
-    # ---- resume? (single-stage only) ----
-    resume_state = load_train_state(args.out) if (args.resume and os.path.isdir(args.out)) else None
-    if resume_state is not None and args.curriculum:
-        print("[sft] WARNING: --resume is single-stage only; ignoring it for --curriculum (starts fresh).")
-        resume_state = None
-    if resume_state is not None:   # don't resume a checkpoint trained on a DIFFERENT dataset/split/vocab
-        prev = resume_state.get("args", {})
-        if (prev.get("data") != args.data or prev.get("train") != args.train
-                or resume_state.get("n_plan") != N_PLAN):
-            print(f"[sft] checkpoint config differs (data={prev.get('data')} train={prev.get('train')} "
-                  f"n_plan={resume_state.get('n_plan')}) vs now (data={args.data} train={args.train} "
-                  f"n_plan={N_PLAN}) — ignoring --resume, starting fresh.")
-            resume_state = None
+    # ------------------------------------------------------------------
+    # CURRICULUM RESUME PATH
+    # ------------------------------------------------------------------
+    if args.resume and args.curriculum:
+        hard_ids_path = os.path.join(args.out, _HARD_IDS_FILE)
+        resume_state = load_train_state(args.out) if os.path.isdir(args.out) else None
 
+        if (resume_state is not None
+                and resume_state.get("stage") == 2
+                and os.path.exists(hard_ids_path)):
+            # Resume was killed mid stage-2. Re-load hard rows from saved ids, skip stage 1.
+            hard_ids = set(json.load(open(hard_ids_path)))
+            hard = [r for r in train_rows if r.get("id") in hard_ids]
+            print(f"[sft] curriculum RESUME mid-stage-2: {len(hard)} hard rows, skipping stage 1")
+            model = JointModel.from_checkpoint(args.base, args.out, device=args.device,
+                                               dtype=_dtype, is_trainable=True,
+                                               plan_max_len=args.plan_max_len)
+            model.backbone.gradient_checkpointing_enable()
+            model.backbone.enable_input_require_grads()
+            s2 = max(1, args.stage2_epochs * math.ceil(len(hard)/args.bs))
+            opt, sched = make_opt_sched(model, args.lr, args.lr_min, s2, args.warmup_frac)
+            restore_optimizer(opt, resume_state, model.device)
+            if sched is not None and resume_state.get("scheduler"):
+                try: sched.load_state_dict(resume_state["scheduler"])
+                except Exception as e: print("[sft] scheduler restore skipped:", e)
+            restore_rng(resume_state)
+            s_ep = resume_state["epoch"]; s_bi = resume_state["batch_idx"]
+            g_step = resume_state["global_step"]
+            ckpt = Checkpointer(args.out, args.base, every_min=args.ckpt_every_min,
+                                every_steps=args.ckpt_every_steps, hf_repo=args.hf_repo)
+            gap2 = run_stage(model, opt, sched, hard, args.stage2_epochs, args, "stage2",
+                             ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi,
+                             global_step=g_step, stage=2)
+            print(f"[sft] curriculum resume complete. held ablation_gap={gap2['ablation_gap']:+.3f}")
+            if probe_rows:
+                print(f"[sft] A4 probe: {json.dumps(probe_diversity(model, probe_rows, max_resp=args.max_resp))}")
+            model.save(args.out, args.base)
+            return
+
+        elif resume_state is not None and resume_state.get("stage") == 1:
+            # Resume killed mid stage-1; continue normally (stage1_out not yet written).
+            print("[sft] curriculum RESUME mid-stage-1: will re-run stage 1 from saved position, then stage 2")
+        else:
+            resume_state = None   # no valid state; start fresh
+    else:
+        # single-stage resume path (original behaviour)
+        resume_state = None
+        if args.resume and not args.curriculum and os.path.isdir(args.out):
+            resume_state = load_train_state(args.out)
+            if resume_state is not None:
+                prev = resume_state.get("args", {})
+                if (prev.get("data") != args.data or prev.get("train") != args.train
+                        or resume_state.get("n_plan") != N_PLAN):
+                    print(f"[sft] checkpoint config differs — ignoring --resume, starting fresh.")
+                    resume_state = None
+
+    # ------------------------------------------------------------------
+    # MODEL CONSTRUCTION
+    # ------------------------------------------------------------------
     if resume_state is not None:
         print(f"[sft] RESUMING from {args.out}: epoch={resume_state['epoch']} "
               f"batch={resume_state['batch_idx']} step={resume_state['global_step']}")
         model = JointModel.from_checkpoint(args.base, args.out, device=args.device,
-                                           is_trainable=True, plan_max_len=args.plan_max_len)
+                                           dtype=_dtype, is_trainable=True,
+                                           plan_max_len=args.plan_max_len)
     else:
-        model = JointModel.from_base(args.base, device=args.device, plan_max_len=args.plan_max_len)
+        model = JointModel.from_base(args.base, device=args.device, dtype=_dtype,
+                                     plan_max_len=args.plan_max_len)
     print(f"[sft] trainable backbone (LoRA) tensors: {model.n_trainable_backbone()}")
-    try:   # trade compute for activation memory so fp32 1.5B + KL base forward fits a T4
+    try:
         model.backbone.gradient_checkpointing_enable()
         model.backbone.enable_input_require_grads()
-        print("[sft] gradient checkpointing ON (lower activation memory).")
+        print("[sft] gradient checkpointing ON.")
     except Exception as e:
         print(f"[sft] gradient checkpointing unavailable ({e})")
     if resume_state is None:
@@ -329,6 +422,10 @@ def main():
               json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
 
     final_held = None
+
+    # ------------------------------------------------------------------
+    # SINGLE-STAGE PATH
+    # ------------------------------------------------------------------
     if not args.curriculum:
         steps = max(1, args.epochs * math.ceil(len(train_rows)/args.bs))
         opt, sched = make_opt_sched(model, args.lr, args.lr_min, steps, args.warmup_frac)
@@ -344,28 +441,58 @@ def main():
             s_ep, s_bi, g_step = (resume_state["epoch"], resume_state["batch_idx"],
                                   resume_state["global_step"])
         final_held = run_stage(model, opt, sched, train_rows, args.epochs, args, "single",
-                               ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi, global_step=g_step)
+                               ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi,
+                               global_step=g_step, stage=None)
+
+    # ------------------------------------------------------------------
+    # CURRICULUM PATH (A3)
+    # ------------------------------------------------------------------
     else:
-        # ---- Stage 1: broad coverage ----
+        hard_ids_path = os.path.join(args.out, _HARD_IDS_FILE)
+
+        # Stage 1: broad coverage
         s1 = max(1, args.stage1_epochs * math.ceil(len(train_rows)/args.bs))
         opt, sched = make_opt_sched(model, args.lr, args.lr_min, s1, args.warmup_frac)
-        gap1 = run_stage(model, opt, sched, train_rows, args.stage1_epochs, args, "stage1")
+        ckpt = Checkpointer(args.out, args.base, every_min=args.ckpt_every_min,
+                            every_steps=args.ckpt_every_steps, hf_repo=args.hf_repo)
+
+        # If resuming mid stage-1, restore position
+        s_ep = s_bi = g_step = 0
+        if resume_state is not None and resume_state.get("stage") == 1:
+            restore_optimizer(opt, resume_state, model.device)
+            restore_rng(resume_state)
+            s_ep, s_bi, g_step = (resume_state["epoch"], resume_state["batch_idx"],
+                                  resume_state["global_step"])
+
+        gap1 = run_stage(model, opt, sched, train_rows, args.stage1_epochs, args, "stage1",
+                         ckpt=ckpt, start_epoch=s_ep, start_batch=s_bi,
+                         global_step=g_step, stage=1)
         if args.stage1_out:
-            model.save(args.stage1_out, args.base); print(f"[sft] stage-1 saved -> {args.stage1_out}")
-        # ---- Stage 2: hard subset selected by the stage-1 model ----
+            model.save(args.stage1_out, args.base)
+            print(f"[sft] stage-1 saved -> {args.stage1_out}")
+
+        # Stage 2: hard subset selected by the stage-1 model
         print("[sft] selecting hard subset with the stage-1 model "
               f"(keep error-rate >= {args.hard_err_rate}) ...")
         hard = hard_subset(model, train_rows, samples=args.hard_samples, max_resp=args.max_resp,
                            err_rate=args.hard_err_rate)
         print(f"[sft] hard subset: {len(hard)}/{len(train_rows)} prompts")
+
         if hard:
+            # Persist hard ids so a killed stage-2 run can be resumed without re-running stage 1.
+            json.dump([r.get("id", i) for i, r in enumerate(hard)], open(hard_ids_path, "w"))
+            print(f"[sft] hard ids saved -> {hard_ids_path}")
             s2 = max(1, args.stage2_epochs * math.ceil(len(hard)/args.bs))
             opt, sched = make_opt_sched(model, args.lr, args.lr_min, s2, args.warmup_frac)
-            gap2 = run_stage(model, opt, sched, hard, args.stage2_epochs, args, "stage2")
-            print(f"[sft] ABLATION GAP: stage1={gap1['ablation_gap']:+.3f} stage2={gap2['ablation_gap']:+.3f} "
+            gap2 = run_stage(model, opt, sched, hard, args.stage2_epochs, args, "stage2",
+                             ckpt=ckpt, stage=2)
+            print(f"[sft] ABLATION GAP: stage1={gap1['ablation_gap']:+.3f} "
+                  f"stage2={gap2['ablation_gap']:+.3f} "
                   f"(curriculum should make plans MORE load-bearing: stage2 >= stage1)")
+            final_held = gap2
         else:
             print("[sft] no hard prompts found — model already solves the set; skip stage 2.")
+            final_held = gap1
 
     if probe_rows:
         div = probe_diversity(model, probe_rows, max_resp=args.max_resp)
@@ -373,18 +500,21 @@ def main():
 
     model.save(args.out, args.base)
     print(f"[sft] saved -> {args.out}")
-    # Report the ACTUAL ablation gap (not a hardcoded claim). Positive = plan is load-bearing.
     gap = (final_held or {}).get("ablation_gap")
     if gap is not None:
         if gap > 0:
-            print(f"[sft] RESULT: held ablation_gap = {gap:+.3f}  ✓ plan is LOAD-BEARING "
-                  "(with-plan beats no-plan).")
+            print(f"[sft] RESULT: held ablation_gap = {gap:+.3f}  ✓ plan is LOAD-BEARING.")
         else:
             print(f"[sft] RESULT: held ablation_gap = {gap:+.3f}  ✗ plan is NOT load-bearing on this "
-                  "data (with-plan ≤ no-plan). Use a plan-sensitive corpus "
-                  "(build_sensitivity_corpus.py) — the plan must causally help the answer.")
+                  "data. Use a plan-sensitive corpus (build_sensitivity_corpus.py).")
+    gc = (final_held or {}).get("gap_content")
+    gp = (final_held or {}).get("gap_presence")
+    if gc is not None:
+        print(f"[sft] gap_content={gc:+.3f}  gap_presence={gp:+.3f}  "
+              f"(want both positive; gap_content>0 proves plan CONTENT matters)")
     print("[sft] acceptance targets: held plan_ce dropped; ablation_gap POSITIVE; "
-          "probe distinct_plans/prompt > 1" + ("; with --curriculum stage2 gap ≥ stage1." if args.curriculum else "."))
+          "gap_content POSITIVE; probe distinct_plans/prompt > 1"
+          + ("; with --curriculum stage2 gap ≥ stage1." if args.curriculum else "."))
 
 
 if __name__ == "__main__":
