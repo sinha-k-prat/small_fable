@@ -1,0 +1,48 @@
+# Stage 2b offline GRPO — A100 80 GB settings.
+#
+# Key differences from the T4 default (configs/grpo.yaml):
+#   --dtype bfloat16    must match SFT and rollout dtype for A6 logp_mismatch guard
+#   --inner_epochs 3    same as T4 — the staleness limit is KL-driven, not hardware
+#   --kl_stop 0.12      slightly tighter than 0.15 default; G=16 gives cleaner groups
+#                       so we can afford to cut earlier and regenerate less often
+#   --held 32           2x default; more reliable held_reward signal on A100
+#   --max_resp 256      must match rollout max_resp
+#   --maxent / --gamma  A1 MGPO bell; gamma=2.0 default targets ±50% accuracy prompts;
+#                       raise to 8–10 if zero_var_frac is still high after rollout filter
+#
+# Plan entropy is logged every inner epoch (plan_entropy in the log line).
+# Watch for collapse (entropy dropping below ~1 nats) — if it happens, add --long2short
+# or tighten --beta_ce to 0.15 to keep the planner exploring.
+#
+# Acceptance: zero_var_frac LOW (<25%); held_reward MOVES across inner epochs;
+# adapter |ΔL2| > 0; plan_entropy STABLE; gap_content still positive in compare.py.
+
+rollouts: rl_rollouts.jsonl
+sft_ckpt: joint_ckpt
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/traces_sft.jsonl
+out: rl_ckpt
+dtype: bfloat16
+inner_epochs: 3
+lr: 1.0e-4
+clip_eps: 0.2
+beta_plan: 1.0
+beta_ce: 0.1              # small CE anchor — keeps planner on-vocab, doesn't pin back to SFT
+max_resp: 256
+kl_stop: 0.12             # cut inner epochs early if exec KL climbs past this
+held: 32
+
+# A1 MaxEnt weighting (replaces zero-variance group deletion)
+maxent: true
+gamma: 2.0                # bell std ≈ 0.5 accuracy units; raise to 8–10 for narrow focus
+
+# A5 brevity shaping among correct trajectories (optional; helps adaptive-mode goal)
+long2short: false         # enable once basic RL is working; adds noise early on
+l2s_lam: 0.2
+
+# Checkpoint every 15 min
+ckpt_every_min: 15.0
+ckpt_every_steps: 0
+
+device: cuda
+seed: 20260616

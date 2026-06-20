@@ -1,0 +1,31 @@
+# Stage 2a offline rollout — A100 80 GB settings.
+#
+# Key differences from the T4 default (configs/rollout.yaml):
+#   --dtype bfloat16    inference also benefits; keeps logp numerics consistent with SFT
+#   --train 400         4x T4 default; more prompts → better coverage of plan distribution
+#   --group 16          2x T4 default; more rollouts/prompt → lower zero-variance fraction
+#                       and better MGPO bell estimates (needs reward variance to work)
+#   --temp 1.3          slightly cooler than T4's 1.5 — with G=16 you need less temperature
+#                       to get variance; too hot increases degenerate/truncated rollouts
+#   --max_resp 256      must match SFT max_resp so token lengths are comparable
+#
+# The A6 logp_mismatch_t0 guard runs at startup — if it fires, the SFT and rollout
+# dtype must match (both bfloat16 here).
+#
+# Output: rl_rollouts.jsonl — inspect pre_rl_filter_report.csv afterward.
+# Target: zero_var fraction < 30% (with G=16 and temp=1.3 this should be comfortable).
+
+sft_ckpt: joint_ckpt
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/traces_sft.jsonl
+train: 400
+dtype: bfloat16
+group: 16
+temp: 1.3
+top_p: 0.98
+max_resp: 256
+out: rl_rollouts.jsonl
+report: pre_rl_filter_report.csv
+filter: true              # A2: mark zero-spread groups keep=False
+device: cuda
+seed: 20260616

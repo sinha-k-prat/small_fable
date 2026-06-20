@@ -1,0 +1,51 @@
+# Stage 1 SFT — A100 80 GB settings.
+#
+# Key differences from the T4 default (configs/sft.yaml):
+#   --dtype bfloat16    native bf16 matmuls; 2x faster than fp32 on Ampere+
+#   --bs 16             4x the T4 default; fits easily on 80 GB
+#   --train 1800        use almost all of sets 1000+2000 (2000 rows total)
+#   --held 200          larger held set → more reliable ablation gap estimate
+#   --max_resp 256      hard reasoning traces need room to reason before committing
+#   --plan_max_len 24   traces sequences run 6–17 tokens; default 12 silently truncates
+#   --curriculum        A3 two-stage broad→hard; stage-2 ids saved for safe resume
+#   --stage1_epochs 4   fewer epochs than T4 (larger batch covers the corpus faster)
+#   --stage2_epochs 2   hard-subset concentration pass
+#   --probe 32          bigger probe for diversity / Pass@k signal
+#   no --hf_repo        omit if you don't need HF streaming; add it for remote resume
+#
+# Data: run traces_to_sft.py first to build dataset/traces_sft.jsonl (see run_a100.sh).
+# The three-way ablation gap (gap_content / gap_presence / ablation_gap) is logged every
+# epoch — both should be positive before starting RL.
+
+base: Qwen/Qwen2.5-1.5B-Instruct
+data: dataset/traces_sft.jsonl
+train: 1800
+held: 200
+dtype: bfloat16
+bs: 16
+lr: 2.0e-5
+lr_min: 8.0e-8
+warmup_frac: 0.05
+lam_resp: 1.0
+lam_kl: 0.1
+max_resp: 256
+plan_max_len: 24
+out: joint_ckpt
+device: cuda
+seed: 20260616
+eval_sample: false        # set true to use sampling during held eval (slower but less greedy bias)
+
+# A3 curriculum
+curriculum: true
+stage1_epochs: 4
+stage2_epochs: 2
+hard_err_rate: 0.75       # keep prompts solved ≤ (1−0.75)×8 = 2/8 times
+hard_samples: 8
+
+# A4 probe (diversity / Pass@k after SFT — predicts RL variance)
+probe: 32
+
+# Checkpoint every 15 min so a crash loses at most one batch block
+ckpt_every_min: 15.0
+ckpt_every_steps: 0
+metrics_out: sft_metrics.jsonl
