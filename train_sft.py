@@ -49,6 +49,7 @@ CLI (A3 resume after kill):
 import argparse, json, math, os, random, time
 import torch, torch.nn.functional as F
 
+import random as _random_mod
 from model_joint import JointModel, encode_plan, decode_plan, PAD_ID, N_PLAN
 from checkers import graded_reward_for_row
 from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
@@ -170,6 +171,51 @@ def eval_held(model, rows, max_resp, sample=False, temp=0.7):
             "gap_content":  acc_gold - acc_rand,   # plan CONTENT matters (not just presence)
             "gap_presence": acc_rand - acc_none,   # soft prefix itself helps
             "ablation_gap": acc_gold - acc_none}   # overall (backwards compat)
+
+
+@torch.no_grad()
+def eval_held_interleaved(model, rows, max_turns, max_plan, max_resp, sample=False, temp=0.7,
+                          seed=0):
+    """Held-out interleaved diagnostics. Three closed-loop decodes per prompt:
+      acc_chosen : run_interleaved with the model's own plans.
+      acc_noplan : force EMPTY plans every turn (BOP->END) -> headline ablation_gap.
+      acc_shuffle: force RANDOM in-vocab primitives every turn -> shuffle_gap.
+    Grades the LAST turn's prose tail (ends 'FINAL ANSWER: X'). Reports both gaps."""
+    if not rows:
+        return {}
+    model.eval()
+    # in-vocab primitives to draw shuffled plans from (exclude PAD + markers/terminator)
+    from model_joint import PLAN_VOCAB, BOP_ID, FINALL_ID, EOP_ID
+    pool = [i for i in range(len(PLAN_VOCAB))
+            if i not in (PAD_ID, BOP_ID, FINALL_ID, EOP_ID)]
+    rng = _random_mod.Random(seed)
+    pce_sum = 0.0
+    corr_chosen = corr_noplan = corr_shuffle = 0.0
+    for r in rows:
+        turns = r.get("turns") or [{"plan": r.get("plan", []), "response": r.get("answer", "")}]
+        p_ids, p_attn = model.batch_prompts([r["instruction"]])
+        try:
+            _, logs = model.interleaved_loss(p_ids, p_attn, [turns], lam_resp=1.0, lam_kl=0.0)
+            pce_sum += logs["ce_plan"]
+        except Exception:
+            pass
+        rec_c = model.run_interleaved(p_ids[0], p_attn[0], sample=sample, temp=temp,
+                                      max_turns=max_turns, max_plan=max_plan, max_resp=max_resp)
+        rec_n = model.run_interleaved(p_ids[0], p_attn[0], sample=sample, temp=temp,
+                                      max_turns=max_turns, max_plan=max_plan, max_resp=max_resp,
+                                      force_plan=lambda t: [])
+        rec_s = model.run_interleaved(
+            p_ids[0], p_attn[0], sample=sample, temp=temp, max_turns=max_turns,
+            max_plan=max_plan, max_resp=max_resp,
+            force_plan=lambda t: [rng.choice(pool) for _ in range(max(1, rng.randint(1, 3)))])
+        corr_chosen += graded_reward_for_row(r, model.interleaved_answer_text(rec_c))
+        corr_noplan += graded_reward_for_row(r, model.interleaved_answer_text(rec_n))
+        corr_shuffle += graded_reward_for_row(r, model.interleaved_answer_text(rec_s))
+    n = len(rows)
+    return {"plan_ce": pce_sum / n, "acc_chosen": corr_chosen / n,
+            "acc_noplan": corr_noplan / n, "acc_shuffle": corr_shuffle / n,
+            "ablation_gap": (corr_chosen - corr_noplan) / n,
+            "shuffle_gap": (corr_chosen - corr_shuffle) / n}
 
 
 @torch.no_grad()
@@ -302,6 +348,10 @@ def main():
     ap.add_argument("--lam_kl", type=float, default=0.1)
     ap.add_argument("--max_resp", type=int, default=64)
     ap.add_argument("--plan_max_len", type=int, default=12)
+    ap.add_argument("--interleaved", action="store_true",
+                    help="agentic closed-loop SFT over turns:[{plan,resp}] (model.interleaved_loss)")
+    ap.add_argument("--max_turns", type=int, default=6)
+    ap.add_argument("--max_plan", type=int, default=12, help="interleaved per-turn plan token cap")
     ap.add_argument("--out", default="joint_ckpt")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default=None,
@@ -417,9 +467,16 @@ def main():
         print("[sft] gradient checkpointing ON.")
     except Exception as e:
         print(f"[sft] gradient checkpointing unavailable ({e})")
+    if args.interleaved:
+        print("[sft] ===== STAGE: interleaved (agentic, closed-loop) SFT =====")
     if resume_state is None:
-        print("[sft] initial held:",
-              json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
+        if args.interleaved:
+            print("[sft] initial held:", json.dumps(eval_held_interleaved(
+                model, held_rows, args.max_turns, args.max_plan, args.max_resp,
+                sample=args.eval_sample, seed=args.seed)))
+        else:
+            print("[sft] initial held:",
+                  json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
 
     final_held = None
 

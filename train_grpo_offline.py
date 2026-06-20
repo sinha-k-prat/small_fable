@@ -7,6 +7,14 @@ policy's per-token logprobs for the saved plan/response tokens, and minimizes th
 clipped objective from grpo_offpolicy.joint_grpo_loss:
 
     L = L_exec_clip + beta_plan * L_plan_clip + beta_ce * CE_plan_anchor
+        [+ kl_resp * KL(exec resp_new || SFT resp_old)   when --kl_resp > 0]
+
+The optional --kl_resp term anchors the FINAL ANSWER distribution to SFT. With --freeze_executor the
+LoRA is frozen, so the executor's SFT vs RL responses differ ONLY because the planner changed the plan
+prefix; this KL (k3, non-negative) penalizes that drift and is differentiable w.r.t. plan_emb (the soft
+plan prefix the frozen executor attends over), so it trains the planner to steer the executor without
+dragging its answers away from SFT. Reference = the cached behavior logp, which IS the SFT executor
+because rollouts are generated once from the SFT checkpoint.
 
 The crux is OFF-POLICY CORRECTION. We reuse each group for `inner_epochs` gradient steps; after
 step 1 the policy drifts from the saved behavior policy, so each token's gradient is scaled by
@@ -86,6 +94,49 @@ def pad_to(seqs, fill, dtype, device):
     return out
 
 
+def _trim_width(old, like):
+    """Pad/truncate a saved (B,L_old) compacted logp tensor to the compacted (B,L_new) width."""
+    B, Ln = like.shape
+    out = torch.zeros(B, Ln, dtype=old.dtype, device=old.device)
+    L = min(old.shape[1], Ln)
+    out[:, :L] = old[:, :L]
+    return out
+
+
+def _compact(logp_full, mask_full):
+    """COMPACT a scattered (B,S) per-position logp + its (B,S) mask down to (B,Lmax) where each row
+    holds only its masked values left-aligned (the same compacted layout rollout_offline saved). Both
+    the rollout (logp_old) and the trainer (logp_new) compact by iterating the mask in sequence order,
+    so the two compacted tensors align position-for-position. Returns (compact_logp, compact_mask)."""
+    B = logp_full.size(0)
+    rows = [logp_full[b][mask_full[b].bool()] for b in range(B)]
+    Lmax = max((r.numel() for r in rows), default=1)
+    Lmax = max(Lmax, 1)
+    out = torch.zeros(B, Lmax, dtype=logp_full.dtype, device=logp_full.device)
+    cmask = torch.zeros(B, Lmax, dtype=torch.float, device=logp_full.device)
+    for b, r in enumerate(rows):
+        out[b, :r.numel()] = r
+        cmask[b, :r.numel()] = 1.0
+    return out, cmask
+
+
+def build_group_tensors_interleaved(model, group):
+    """Interleaved variant: recompute temp=1 logp over the WHOLE multi-turn trajectory via
+    interleaved_logp_tf and return ONE concatenated plan stream + ONE concatenated resp stream per
+    trajectory. These ARE the PLAN/RESP position sets joint_grpo_loss consumes UNCHANGED (exec_mask =
+    response tokens only; plan ratio over plan-vocab steps only). resp_logp_new doubles as both the
+    teacher-forced new logp AND, at pass 0, matches resp_logp_old (A6)."""
+    instrs = [g["instruction"] for g in group]
+    p_ids, p_attn = model.batch_prompts(instrs)
+    turns_batch = [g["turns"] for g in group]
+    plan_logp_old = pad_to([g["plan_logp_old"] for g in group], 0.0, torch.float, model.device)
+    resp_logp_old = pad_to([g["resp_logp_old"] for g in group], 0.0, torch.float, model.device)
+    rewards = torch.tensor([g["reward"] for g in group], dtype=torch.float, device=model.device)
+    lengths = torch.tensor([g.get("resp_len", len(g["resp_tokens"])) for g in group],
+                           dtype=torch.float, device=model.device)
+    return p_ids, p_attn, turns_batch, plan_logp_old, resp_logp_old, rewards, lengths
+
+
 def build_group_tensors(model, group):
     """From G rollout records -> padded tensors for one group (B=G)."""
     assert all(g["id"] == group[0]["id"] for g in group), \
@@ -142,6 +193,36 @@ def logp_mismatch_t0(model, group):
     return float((dp + dr) / 2)
 
 
+@torch.no_grad()
+def logp_mismatch_t0_interleaved(model, group):
+    """A6 for the interleaved path: trainer-recomputed concatenated plan+resp logp must match the saved
+    logp_old over masked positions (exec_ratio~1 at pass 0)."""
+    (p_ids, p_attn, turns_batch, plan_logp_old, resp_logp_old, _, _) = \
+        build_group_tensors_interleaved(model, group)
+    pl_full, pm_full, rl_full, rm_full = model.interleaved_logp_tf(p_ids, p_attn, turns_batch, temp=1.0)
+    plan_new, pmask = _compact(pl_full, pm_full); resp_new, rmask = _compact(rl_full, rm_full)
+    plan_old = _trim_width(plan_logp_old, pmask); resp_old = _trim_width(resp_logp_old, rmask)
+    dp = ((plan_new - plan_old).abs() * pmask).sum() / pmask.sum().clamp_min(1)
+    dr = ((resp_new - resp_old).abs() * rmask).sum() / rmask.sum().clamp_min(1)
+    return float((dp + dr) / 2)
+
+
+@torch.no_grad()
+def held_reward_interleaved(model, held_rows, max_turns, max_resp, temp=0.7):
+    """Interleaved held reward: run_interleaved (sampled), grade the last turn's prose tail."""
+    if not held_rows:
+        return None
+    model.eval()
+    corr = 0
+    for r in held_rows:
+        p_ids, p_attn = model.batch_prompts([r["instruction"]])
+        rec = model.run_interleaved(p_ids[0], p_attn[0], temp=temp, sample=True,
+                                    max_turns=max_turns, max_resp=max_resp)
+        corr += graded_reward_for_row(r, model.interleaved_answer_text(rec))
+    model.train()
+    return corr / len(held_rows)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rollouts", default="rl_rollouts.jsonl")
@@ -154,6 +235,14 @@ def main():
     ap.add_argument("--clip_eps", type=float, default=0.2)
     ap.add_argument("--beta_plan", type=float, default=1.0)
     ap.add_argument("--beta_ce", type=float, default=0.1)
+    ap.add_argument("--kl_resp", type=float, default=0.0,
+                    help="KL-to-SFT anchor on RESPONSE tokens: kl_resp * KL(exec resp_new || SFT "
+                         "resp_old), k3 estimator (non-negative). Penalizes the planner for steering "
+                         "the (frozen) executor's answers away from the SFT response distribution. "
+                         "0 = off. Reference = cached behavior logp == SFT executor (rollouts come "
+                         "from the SFT ckpt). Differentiable w.r.t. plan_emb.")
+    ap.add_argument("--lam_resp", type=float, default=1.0,
+                    help="executor clipped-objective weight (forced to 0 by --freeze_executor)")
     ap.add_argument("--max_resp", type=int, default=64)
     ap.add_argument("--kl_stop", type=float, default=0.15, help="cut inner epochs if approx_kl exceeds this")
     ap.add_argument("--held", type=int, default=16, help="held instructions for held_reward (0=skip)")
@@ -184,6 +273,13 @@ def main():
     ap.add_argument("--dtype", default=None,
                     help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA, float32 on CPU)")
     ap.add_argument("--seed", type=int, default=20260616)
+    ap.add_argument("--interleaved", action="store_true",
+                    help="agentic GRPO: concatenated plan/resp streams via interleaved_logp_tf, fed "
+                         "to the UNCHANGED joint_grpo_loss.")
+    ap.add_argument("--max_turns", type=int, default=6)
+    ap.add_argument("--freeze_executor", action="store_true",
+                    help="PLANNER-ONLY RL: freeze LoRA adapters + set lam_resp=0 so ONLY the planner "
+                         "head + plan_emb train (clipped plan-policy term + beta_ce CE anchor).")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
 
@@ -252,14 +348,17 @@ def main():
     # A6: validate the offline importance ratio is sane at step 0 (BEFORE any update). Skip on resume:
     # after some training the policy has drifted, so logp_old no longer matches by design.
     if resume_state is None:
-        mm = logp_mismatch_t0(model, groups[0])
+        mm = (logp_mismatch_t0_interleaved(model, groups[0]) if args.interleaved
+              else logp_mismatch_t0(model, groups[0]))
         print(f"[grpo] logp_mismatch_t0 = {mm:.3e} (must be ~0; tol={args.mismatch_tol:g})")
         if mm > args.mismatch_tol:
             print("[grpo] WARNING: logp_mismatch_t0 exceeds tol — saved logp_old was recorded with a "
                   "DIFFERENT numerical path than training. Re-record logp_old via the HF teacher-forced "
                   "forward (rollout_offline already does this). The IS ratio is invalid until this is ~0.")
         if args.held:
-            print(f"[grpo] held_reward(before RL) = {held_reward(model, held_rows, args.max_resp):.3f}")
+            hr0 = (held_reward_interleaved(model, held_rows, args.max_turns, args.max_resp)
+                   if args.interleaved else held_reward(model, held_rows, args.max_resp))
+            print(f"[grpo] held_reward(before RL) = {hr0:.3f}")
 
     # A1b: per-prompt p_q histogram (logged each inner epoch so the operator sees the bell working)
     def pq_hist(vals):
@@ -280,8 +379,12 @@ def main():
             if gi < sgi:
                 continue
             group = groups[gi]
-            (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
-             plan_logp_old, resp_logp_old, rewards, lengths) = build_group_tensors(model, group)
+            if args.interleaved:
+                (p_ids, p_attn, turns_batch, plan_logp_old, resp_logp_old,
+                 rewards, lengths) = build_group_tensors_interleaved(model, group)
+            else:
+                (p_ids, p_attn, plan_ids, resp_ids, resp_attn,
+                 plan_logp_old, resp_logp_old, rewards, lengths) = build_group_tensors(model, group)
             G = len(group)
             path = group[0].get("reward_path", "verifiable")
 
@@ -330,15 +433,26 @@ def main():
                 rewards=rewards, group_size=G,
                 exec_logp_new=resp_logp_new, exec_logp_old=resp_logp_old, exec_mask=resp_mask,
                 plan_logp_new=plan_logp_new, plan_logp_old=plan_logp_old, plan_mask=plan_mask,
-                beta_plan=args.beta_plan, clip_eps=args.clip_eps,
+                beta_plan=args.beta_plan, clip_eps=args.clip_eps, lam_resp=args.lam_resp,
                 ce_plan=ce_plan, beta_ce=args.beta_ce, adv_weights=adv_weights)
+
+            # KL-to-SFT anchor on response tokens (k3, non-negative). delta = resp_logp_new (grad,
+            # via plan_emb) - resp_logp_old (the cached SFT reference, constant). k3 pulls new->old
+            # from both sides, so the planner can't drag the frozen executor's answers off the SFT
+            # distribution. Clamp delta for exp() numerical safety.
+            if args.kl_resp > 0:
+                delta = (resp_logp_new - resp_logp_old).clamp(-10.0, 10.0)
+                k3 = torch.exp(-delta) - 1.0 + delta
+                kl_resp = (k3 * resp_mask).sum() / resp_mask.sum().clamp_min(1)
+                loss = loss + args.kl_resp * kl_resp
+                logs["kl_resp"] = float(kl_resp)
 
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             global_step += 1
             for k in ("total_loss", "l_exec", "exec_approx_kl", "exec_clip_frac",
-                      "plan_approx_kl", "zero_var_frac"):
+                      "plan_approx_kl", "zero_var_frac", "kl_resp"):
                 agg[k] += logs.get(k, 0.0)
             # plan_entropy already accumulated above
             agg["n"] += 1
@@ -347,7 +461,11 @@ def main():
                           reason=f"grpo-ie{ie+1}-g{gi+1}")
 
         n = max(agg["n"], 1)
-        hr = held_reward(model, held_rows, args.max_resp) if args.held else None
+        if args.held:
+            hr = (held_reward_interleaved(model, held_rows, args.max_turns, args.max_resp)
+                  if args.interleaved else held_reward(model, held_rows, args.max_resp))
+        else:
+            hr = None
         ekl = agg["exec_approx_kl"]/n
         wv = sum(w_by_path["verifiable"])/max(1, len(w_by_path["verifiable"]))
         wr = sum(w_by_path["rubric"])/max(1, len(w_by_path["rubric"]))
@@ -357,6 +475,7 @@ def main():
               f"exec_approx_kl={ekl:.4f} exec_clip_frac={agg['exec_clip_frac']/n:.3f} "
               f"plan_approx_kl={agg['plan_approx_kl']/n:.4f} plan_entropy={plan_ent:.3f} "
               + (f"held_reward={hr:.3f} " if hr is not None else "")
+              + f"executor={'FROZEN' if args.freeze_executor else 'trainable'} "
               + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
               f"p_q_hist[0-1]={pq_hist(pqs)}")
         # end-of-inner-epoch checkpoint: next position = (ie+1, 0)

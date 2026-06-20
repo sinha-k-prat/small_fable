@@ -47,6 +47,59 @@ def parse_plan(trace):
     seq.append(END)
     return seq
 
+def _factor_primitive_group(inner):
+    """'MODEL[as=truth_table] ; LINK[guard=on]' inner -> ['MODEL','as=truth_table','LINK','guard=on'].
+    Same factoring rule parse_plan uses, but for a SINGLE turn header (one TURN's brackets)."""
+    out = []
+    for prim in inner.split(';'):
+        prim = prim.strip()
+        if not prim:
+            continue
+        out.append(prim.split('[')[0].strip())
+        pm = re.search(r'\[(.*)\]', prim)
+        if pm:
+            for kv in pm.group(1).split(','):
+                kv = kv.strip().replace(' ', '')
+                if kv and kv.split('=')[0] not in DROP_PARAMS:
+                    out.append(kv)
+    return out
+
+
+def parse_turns(trace):
+    """Walk the raw trace turn-by-turn. Each 'TURN n [ ... ]' header starts a turn whose plan is the
+    factored primitives+atoms; the following 'response:' lines (until the next TURN) are its prose.
+    Returns [{'plan':[...], 'response':'...'}]. The per-turn plan does NOT include END/markers here;
+    model_joint's assembler inserts BOP/END/RESP_EOS."""
+    turns, cur = [], None
+    for line in trace.splitlines():
+        m = TURN_RE.match(line)
+        if m:
+            if cur is not None:
+                cur['response'] = ' '.join(cur.pop('_resp')).strip(); turns.append(cur)
+            cur = {'plan': _factor_primitive_group(m.group(1)), '_resp': []}
+            continue
+        s = line.strip()
+        if cur is not None and s.lower().startswith('response:'):
+            cur['_resp'].append(s[len('response:'):].strip())
+    if cur is not None:
+        cur['response'] = ' '.join(cur.pop('_resp')).strip(); turns.append(cur)
+    return turns
+
+
+def convert_interleaved(trace_row, ak, i):
+    """Wrap the existing flat convert(): keep ALL flat fields (DUAL-WRITE), ADD 'turns'. The terminal
+    turn's response gets the committed 'FINAL ANSWER: X' tail so the answer-key grader has a span."""
+    rec = convert(trace_row, ak, i)               # flat convert() -> plan/answer/checker/...
+    turns = parse_turns(trace_row['trace'])
+    if not turns:                                  # degenerate trace with no TURN headers -> one turn
+        turns = [{'plan': [], 'response': parse_answer(trace_row['trace'])}]
+    if ak is not None and 'FINAL ANSWER:' in rec['answer']:
+        tail = rec['answer'].split('FINAL ANSWER:', 1)[1]
+        turns[-1]['response'] = turns[-1]['response'].rstrip() + '\nFINAL ANSWER:' + tail
+    rec['turns'] = turns
+    return rec
+
+
 def parse_answer(trace):
     """Executor target = the reasoning prose (all `response:` lines joined)."""
     out = []
@@ -111,6 +164,9 @@ def main():
                     help='shuffle the corpus (seeded) so the train/held split is representative')
     ap.add_argument('--no-shuffle', dest='shuffle', action='store_false')
     ap.add_argument('--seed', type=int, default=20260616)
+    ap.add_argument('--interleaved', action='store_true',
+                    help='ALSO emit per-turn turns:[{plan,response}] (dual-write) and append BOP/'
+                         'FINALIZE_ALL plan-vocab markers + {"interleaved":true,"markers":{...}}.')
     args = ap.parse_args()
     import os
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
@@ -126,7 +182,9 @@ def main():
             row = json.loads(line)
             ak = key.get(row['instruction'])
             matched += ak is not None
-            recs.append(convert(row, ak, len(recs)))
+            rec = (convert_interleaved(row, ak, len(recs)) if args.interleaved
+                   else convert(row, ak, len(recs)))
+            recs.append(rec)
     if args.shuffle:                                       # representative train/held split
         import random
         random.Random(args.seed).shuffle(recs)
@@ -138,10 +196,23 @@ def main():
                     seen.add(p); vocab_order.append(p)
             f.write(json.dumps(rec, ensure_ascii=False) + '\n')
     vocab = ['PAD'] + vocab_order
-    json.dump({'vocab': vocab, 'terminator': END}, open(args.vocab_out, 'w'), indent=1)
+    markers = {}
+    if args.interleaved:
+        # APPEND the interleaved control markers after the data tokens so existing ids stay stable.
+        # END already exists (added by parse_plan) and is reused as the per-turn PLAN_EOS.
+        for ctrl in ('BOP', 'FINALIZE_ALL'):
+            if ctrl not in vocab:
+                vocab.append(ctrl)
+        markers = {'BOP': 'BOP', 'PLAN_EOS': END, 'FINALIZE_ALL': 'FINALIZE_ALL'}
+    out_vocab = {'vocab': vocab, 'terminator': END}
+    if args.interleaved:                                   # flat plan_vocab.json stays byte-identical
+        out_vocab['interleaved'] = True
+        out_vocab['markers'] = markers
+    json.dump(out_vocab, open(args.vocab_out, 'w'), indent=1)
     print(f"wrote {len(recs)} rows -> {args.out}  (answer-key matched {matched}/{len(recs)}, "
-          f"shuffled={args.shuffle})")
-    print(f"wrote {args.vocab_out}: {len(vocab)} tokens (primitives + param-atoms), terminator={END}")
+          f"shuffled={args.shuffle}, interleaved={args.interleaved})")
+    print(f"wrote {args.vocab_out}: {len(vocab)} tokens (primitives + param-atoms"
+          f"{'+ BOP/FINALIZE_ALL markers' if args.interleaved else ''}), terminator={END}")
 
 if __name__ == '__main__':
     main()
