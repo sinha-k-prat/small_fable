@@ -1,8 +1,17 @@
-# Core. transformers >= 4.51 is the spec target (Qwen2.5 works from 4.44; pin newer for fixes).
+# Core. transformers>=4.51,<5 is required: inputs_embeds generate() returns new tokens only
+# from 4.44 onward but 4.51+ has Qwen2.5 support fixes and the <5 cap avoids breaking API changes.
 torch>=2.2
-transformers>=4.51
+transformers>=4.51,<5
 peft>=0.11
 accelerate>=0.30
 safetensors>=0.4
+
+# A100 / H100 recommended settings (80 GB):
+#   --dtype bfloat16    (native bf16 matmuls; 2x faster than fp32, same stable on Ampere+)
+#   --bs 8 or 16        (larger batches fit easily; scale up from the default of 4)
+#   --group 16          (more rollouts per prompt -> better GRPO variance estimates)
+#   --max_resp 256      (hard reasoning traces need more room than the 64-token default)
+#   gradient checkpointing is still beneficial but less critical than on T4/A10
+
 # optional: only if you want to cross-check against a reference GRPO impl
 # trl>=0.9

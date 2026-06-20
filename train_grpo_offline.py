@@ -139,6 +139,8 @@ def build_group_tensors_interleaved(model, group):
 
 def build_group_tensors(model, group):
     """From G rollout records -> padded tensors for one group (B=G)."""
+    assert all(g["id"] == group[0]["id"] for g in group), \
+        f"group contains mixed instruction ids: {[g['id'] for g in group]}"
     instrs = [g["instruction"] for g in group]
     p_ids, p_attn = model.batch_prompts(instrs)
     plan_ids = pad_to([g["plan_tokens"] for g in group], PAD_ID, torch.long, model.device)
@@ -268,6 +270,8 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="resume from --out if it contains a train_state.pt")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dtype", default=None,
+                    help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA, float32 on CPU)")
     ap.add_argument("--seed", type=int, default=20260616)
     ap.add_argument("--interleaved", action="store_true",
                     help="agentic GRPO: concatenated plan/resp streams via interleaved_logp_tf, fed "
@@ -278,6 +282,10 @@ def main():
                          "head + plan_emb train (clipped plan-policy term + beta_ce CE anchor).")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
+
+    _dtype = None
+    if args.dtype and args.dtype != "auto":
+        _dtype = getattr(torch, args.dtype)
 
     # --- load model FOR TRAINING. is_trainable=True is mandatory (frozen-backbone guard).
     #     On --resume, continue from the RL checkpoint (--out); else start from the SFT checkpoint. ---
@@ -295,28 +303,10 @@ def main():
         print(f"[grpo] RESUMING from {args.out}: inner_epoch={resume_state['inner_epoch']} "
               f"group={resume_state['group_idx']} step={resume_state['global_step']}")
     model = JointModel.from_checkpoint(args.base, load_from, device=args.device,
-                                       is_trainable=True)
-    if args.interleaved:
-        model.interleaved = True
-        model._assert_interleaved()
-    # PLANNER-ONLY RL: freeze the LoRA executor adapters + zero lam_resp so ONLY the planner head and
-    # plan embeddings train (via the clipped plan-policy term + the beta_ce CE anchor).
-    if args.freeze_executor:
-        for n, p in model.backbone.named_parameters():
-            if "lora_" in n:
-                p.requires_grad = False
-        args.lam_resp = 0.0
-        n_planner = sum(p.numel() for p in model.planner.parameters() if p.requires_grad) \
-                    + sum(p.numel() for p in model.plan_emb.parameters() if p.requires_grad)
-        assert n_planner > 0, ("FROZEN-PLANNER BUG: --freeze_executor but 0 trainable PLANNER params "
-                               "(planner head + plan_emb). Nothing would train.")
-        print(f"[grpo] PLANNER-ONLY RL: executor (LoRA) FROZEN; trainable planner params={n_planner} "
-              f"(planner head + plan_emb). lam_resp forced to 0.")
-    else:
-        args.lam_resp = getattr(args, "lam_resp", 1.0)
-        n_bb = model.n_trainable_backbone()
-        assert n_bb > 0, "FROZEN-BACKBONE BUG: 0 trainable backbone tensors -> RL is a no-op."
-        print(f"[grpo] >0 trainable backbone tensors: {n_bb} (≈336 expected) -- RL will actually move.")
+                                       dtype=_dtype, is_trainable=True)
+    n_bb = model.n_trainable_backbone()
+    assert n_bb > 0, "FROZEN-BACKBONE BUG: 0 trainable backbone tensors -> RL is a no-op."
+    print(f"[grpo] >0 trainable backbone tensors: {n_bb} (≈336 expected) -- RL will actually move.")
 
     # T4 memory: the fp32 1.5B + three forward graphs over a group of G don't fit at full activation
     # footprint. Gradient checkpointing recomputes activations in backward instead of storing them.
@@ -380,7 +370,7 @@ def main():
     for ie in range(start_ie, args.inner_epochs):
         model.train(); t0 = time.time()
         agg = {"total_loss": 0.0, "l_exec": 0.0, "exec_approx_kl": 0.0, "exec_clip_frac": 0.0,
-               "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "kl_resp": 0.0, "n": 0}
+               "plan_approx_kl": 0.0, "zero_var_frac": 0.0, "plan_entropy": 0.0, "n": 0}
         w_by_path = {"verifiable": [], "rubric": [], "judge": []}
         std_by_path = {"verifiable": [], "rubric": [], "judge": []}
         pqs = []
@@ -417,23 +407,18 @@ def main():
                 w_by_path[path].append(float(adv_weights.mean()))
             std_by_path[path].append(float(rewards.view(-1, G).std(unbiased=False).mean()))
 
-            # current-policy logprobs for the SAME saved tokens (temp=1 -> the policy). The interleaved
-            # path recomputes ONE concatenated plan stream + ONE resp stream over the whole trajectory;
-            # the flat path scores plan and resp segments separately. BOTH feed the UNCHANGED loss.
-            if args.interleaved:
-                pl_full, pm_full, rl_full, rm_full = model.interleaved_logp_tf(
-                    p_ids, p_attn, turns_batch, temp=1.0)
-                # COMPACT the scattered (B,S) recomputed logp to the left-aligned layout rollout_offline
-                # saved logp_old in, so logp_new and logp_old align position-for-position. Then trim the
-                # saved (already-compacted) logp_old to the same width.
-                plan_logp_new, plan_mask = _compact(pl_full, pm_full)
-                resp_logp_new, resp_mask = _compact(rl_full, rm_full)
-                plan_logp_old = _trim_width(plan_logp_old, plan_mask)
-                resp_logp_old = _trim_width(resp_logp_old, resp_mask)
-            else:
-                plan_logp_new, plan_mask = model.plan_logp_tf(p_ids, p_attn, plan_ids, temp=1.0)
-                resp_logp_new, resp_mask = model.resp_logp_tf(p_ids, p_attn, plan_ids,
-                                                              resp_ids, resp_attn, temp=1.0)
+            # current-policy logprobs for the SAME saved tokens (temp=1 -> the policy)
+            plan_logp_new, plan_mask = model.plan_logp_tf(p_ids, p_attn, plan_ids, temp=1.0)
+            resp_logp_new, resp_mask = model.resp_logp_tf(p_ids, p_attn, plan_ids,
+                                                          resp_ids, resp_attn, temp=1.0)
+            # Plan entropy: H = -sum(p * log p) over non-PAD plan tokens. A collapsing
+            # entropy warns that the planner is converging to a degenerate single-plan mode.
+            with torch.no_grad():
+                _plan_logits = model.planner_logits_tf(p_ids, p_attn, plan_ids)
+                _plan_probs = torch.softmax(_plan_logits, dim=-1)
+                _plan_ent = -(_plan_probs * _plan_probs.clamp_min(1e-9).log()).sum(-1)
+                _plan_ent_mean = (_plan_ent * plan_mask).sum() / plan_mask.sum().clamp_min(1)
+            agg["plan_entropy"] += float(_plan_ent_mean)
 
             # small CE anchor toward the gold plan (keeps planner from wandering off-vocab)
             gold = data[group[0]["id"]]
@@ -469,6 +454,7 @@ def main():
             for k in ("total_loss", "l_exec", "exec_approx_kl", "exec_clip_frac",
                       "plan_approx_kl", "zero_var_frac", "kl_resp"):
                 agg[k] += logs.get(k, 0.0)
+            # plan_entropy already accumulated above
             agg["n"] += 1
             if ckpt.due(global_step):
                 ckpt.save(model, _grpo_state(ie, gi + 1, global_step, opt, args),
@@ -483,11 +469,11 @@ def main():
         ekl = agg["exec_approx_kl"]/n
         wv = sum(w_by_path["verifiable"])/max(1, len(w_by_path["verifiable"]))
         wr = sum(w_by_path["rubric"])/max(1, len(w_by_path["rubric"]))
+        plan_ent = agg["plan_entropy"]/n
         print(f"[grpo] inner_epoch {ie+1}/{args.inner_epochs} ({time.time()-t0:.1f}s) "
               f"loss={agg['total_loss']/n:.4f} l_exec={agg['l_exec']/n:.4f} "
               f"exec_approx_kl={ekl:.4f} exec_clip_frac={agg['exec_clip_frac']/n:.3f} "
-              f"plan_approx_kl={agg['plan_approx_kl']/n:.4f} "
-              + (f"kl_resp(to-SFT)={agg['kl_resp']/n:.4f} " if args.kl_resp > 0 else "")
+              f"plan_approx_kl={agg['plan_approx_kl']/n:.4f} plan_entropy={plan_ent:.3f} "
               + (f"held_reward={hr:.3f} " if hr is not None else "")
               + f"executor={'FROZEN' if args.freeze_executor else 'trainable'} "
               + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
@@ -507,7 +493,8 @@ def main():
           f"|Δ|={abs(l2_end-l2_start):.4f}  (must be > 0 to prove RL ≠ SFT)")
     print("[grpo] plan-token distribution (rollout/before):",
           dict(plan_dist_before.most_common(8)))
-    print("[grpo] ACCEPTANCE: zero_var_frac LOW; held_reward MOVED across inner epochs; |ΔL2|>0.")
+    print("[grpo] ACCEPTANCE: zero_var_frac LOW; held_reward MOVED across inner epochs; "
+          "|ΔL2|>0; plan_entropy STABLE (collapse -> add entropy bonus or regenerate).")
 
 
 if __name__ == "__main__":
