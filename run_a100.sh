@@ -84,7 +84,7 @@ python -u train_sft.py \
   --dtype bfloat16 \
   --bs 16 \
   --lr 2e-5 --lr_min 8e-8 --warmup_frac 0.05 \
-  --lam_resp 1.0 --lam_kl 0.1 \
+  --lam_resp 1.0 --lam_kl 0.5 \
   --max_resp 256 --plan_max_len 24 \
   --curriculum \
   --stage1_epochs 4 --stage2_epochs 2 --hard_err_rate 0.75 --hard_samples 8 \
