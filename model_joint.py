@@ -60,20 +60,31 @@ _VOCAB_FILE = os.environ.get("PLAN_VOCAB_FILE",
                              os.path.join(os.path.dirname(os.path.abspath(__file__)), _VOCAB_FILE_NAME))
 if os.path.exists(_VOCAB_FILE):
     _vc = json.load(open(_VOCAB_FILE))
-    PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", _DEFAULT_TERM_NAME)
-    _MARKERS   = _vc.get("markers", {})   # only present in interleaved vocab
+    PLAN_VOCAB = _vc["vocab"]
+    _TERM_NAME = _vc.get("terminator", _DEFAULT_TERM_NAME)
+    _MARKERS   = _vc.get("markers", {})        # only present in interleaved vocab
 else:
-    PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = _DEFAULT_TERM_NAME
-    _MARKERS   = {}                        # flat (non-interleaved) path
-PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
-ID2PLAN = {i:p for p,i in PLAN2ID.items()}
+    PLAN_VOCAB = _DEFAULT_PLAN_VOCAB
+    _TERM_NAME = _DEFAULT_TERM_NAME
+    _MARKERS   = {}                             # flat (non-interleaved) path
+
+PLAN2ID = {p: i for i, p in enumerate(PLAN_VOCAB)}
+ID2PLAN = {i: p for p, i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
-# Terminator matched by BASE name so every parameterized variant (FINALIZE[form=yes_no],
-# FINALIZE[form=number_with_units], …) ends a plan. TERM_ID is a single representative for legacy.
+
 _TERM_BASE = _TERM_NAME.split("[")[0]
 TERM_IDS = {i for p, i in PLAN2ID.items() if p.split("[")[0] == _TERM_BASE}
 TERM_ID  = min(TERM_IDS) if TERM_IDS else len(PLAN_VOCAB) - 1
 N_PLAN   = len(PLAN_VOCAB)
+
+# Interleaved marker ids — None for flat vocab, set for interleaved vocab.
+# _assert_interleaved() checks these are not None before any interleaved call.
+BOP_ID    = PLAN2ID.get(_MARKERS.get("BOP", "__absent__"))
+FINALL_ID = PLAN2ID.get(_MARKERS.get("FINALIZE_ALL", "__absent__"))
+EOP_ID    = PLAN2ID.get(_MARKERS.get("PLAN_EOS", "__absent__"), TERM_ID)
+
+# True when loaded from an interleaved plan_vocab.json (has BOP/FINALIZE_ALL markers).
+INTERLEAVED_VOCAB = BOP_ID is not None and FINALL_ID is not None
 
 # Cached tensor for vectorised terminator membership test (filled on first GPU call).
 _TERM_IDS_TENSOR: torch.Tensor | None = None
@@ -101,15 +112,6 @@ def _resolve_dtype(dtype, device: str) -> torch.dtype:
     if dtype is not None:
         return dtype
     return torch.bfloat16 if (device != "cpu" and torch.cuda.is_available()) else torch.float32
-
-# Interleaved (agentic) control-marker ids. These are PLAN-vocab ids (embedded by plan_emb, predicted
-# by the planner). On a FLAT vocab they are None and the interleaved path asserts out (see
-# _assert_interleaved). EOP (the per-turn plan terminator / handoff) reuses the existing END/TERM_ID.
-BOP_ID    = PLAN2ID.get(_MARKERS.get("BOP", "BOP"))
-FINALL_ID = PLAN2ID.get(_MARKERS.get("FINALIZE_ALL", "FINALIZE_ALL"))
-# PLAN_EOS == per-turn handoff: prefer the marker name, fall back to the existing terminator id.
-_eop_name = _MARKERS.get("PLAN_EOS", _TERM_NAME)
-EOP_ID    = PLAN2ID.get(_eop_name, TERM_ID)
 
 
 def build_lora(base_model, r=16, alpha=32, dropout=0.05, is_trainable=True):
