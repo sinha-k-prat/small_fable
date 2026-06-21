@@ -61,8 +61,10 @@ _VOCAB_FILE = os.environ.get("PLAN_VOCAB_FILE",
 if os.path.exists(_VOCAB_FILE):
     _vc = json.load(open(_VOCAB_FILE))
     PLAN_VOCAB = _vc["vocab"]; _TERM_NAME = _vc.get("terminator", _DEFAULT_TERM_NAME)
+    _MARKERS   = _vc.get("markers", {})   # only present in interleaved vocab
 else:
     PLAN_VOCAB = _DEFAULT_PLAN_VOCAB; _TERM_NAME = _DEFAULT_TERM_NAME
+    _MARKERS   = {}                        # flat (non-interleaved) path
 PLAN2ID = {p:i for i,p in enumerate(PLAN_VOCAB)}
 ID2PLAN = {i:p for p,i in PLAN2ID.items()}
 PAD_ID  = PLAN2ID["PAD"]
