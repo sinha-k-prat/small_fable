@@ -5,6 +5,7 @@ transformers>=4.51,<5
 peft>=0.11
 accelerate>=0.30
 safetensors>=0.4
+matplotlib>=3.5      # train/val error-curve plots in train_sft_contrastive.py (preinstalled on Colab)
 
 # A100 / H100 recommended settings (80 GB):
 #   --dtype bfloat16    (native bf16 matmuls; 2x faster than fp32, same stable on Ampere+)

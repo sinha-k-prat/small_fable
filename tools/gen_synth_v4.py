@@ -17,7 +17,7 @@ Output row schema (drop-in for the existing pipeline + checkers.py):
    hard_negatives:[{plan, plan_str, answer}, x3],
    checker_kind:"numeric", checker_args:{canonical:{value}, match:{tolerance}}, reward_path}
 """
-import json, random, argparse, itertools, collections
+import json, os, random, argparse, itertools, collections
 
 # --------------------------------------------------------------------------- interpreter
 OPS = ["SET", "ADD", "SUB", "MUL", "DIV"]          # the reusable primitive vocabulary
@@ -154,6 +154,52 @@ def s_savings(rng):
 
 SCHEMAS = [s_profit, s_interest, s_distance, s_discount_tax, s_total_cost, s_work_rate, s_recipe, s_savings]
 
+
+def build_one_row(rng, seen_instr, idx, args):
+    """One sampling attempt: returns a valid, deduped, oracle-verified row dict (and records its
+    instruction in seen_instr), or None if this attempt is rejected."""
+    schema = rng.choice(SCHEMAS)                          # random -> balanced, no exhaustion deadlock
+    cat, instr, plan, pool = schema(rng)
+    if instr in seen_instr:                               # dedupe identical instances
+        return None
+    gold = execute(plan)
+    if gold is None:
+        return None
+    gold_f = fmt(gold)
+    negs = pick_hard_negatives(plan, sorted(pool), gold_f, rng, k=args.k)
+    if len(negs) < args.k:                                # demand k verified negatives
+        return None
+    seen_instr.add(instr)
+    return {
+        "id": f"syn_{idx:04d}",
+        "category": cat,
+        "instruction": instr,
+        "plan": plan,
+        "plan_str": plan_str(plan),
+        "answer": gold_f,
+        "hard_negatives": [
+            {"plan": c, "plan_str": plan_str(c), "answer": fmt(a)} for c, a in negs],
+        "checker_kind": "numeric",
+        "checker_args": {"canonical": {"value": float(gold_f)}, "match": {"tolerance": 0.01}},
+        "reward_path": "verifiable",
+    }
+
+
+def generate_batch(rng, seen_instr, per, n, start_idx, args):
+    """Generate n valid rows, SHARING rng + seen_instr + per across calls (so a second batch is
+    disjoint from the first by construction). Returns (rows, next_idx)."""
+    batch, idx, attempts = [], start_idx, 0
+    while len(batch) < n and attempts < n * 40:
+        attempts += 1
+        row = build_one_row(rng, seen_instr, idx, args)
+        if row is None:
+            continue
+        per[row["category"]] += 1
+        batch.append(row)
+        idx += 1
+    return batch, idx
+
+
 # --------------------------------------------------------------------------- driver
 def main():
     ap = argparse.ArgumentParser()
@@ -161,49 +207,36 @@ def main():
     ap.add_argument("--k", type=int, default=3)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default="dataset/sft_synth_v4.jsonl")
+    ap.add_argument("--val_n", type=int, default=0,
+                    help="rows for a holdout VALIDATION set, generated AFTER the n training rows "
+                         "from the SAME rng + seen_instr dedupe set (guaranteed disjoint).")
+    ap.add_argument("--val_out", default="dataset/sft_synth_v4_val.jsonl")
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
-    rows, idx, attempts = [], 0, 0
     seen_instr = set()
     per = collections.Counter()
-    while len(rows) < args.n and attempts < args.n * 40:
-        attempts += 1
-        schema = rng.choice(SCHEMAS)                     # random -> balanced, no exhaustion deadlock
-        cat, instr, plan, pool = schema(rng)
-        if instr in seen_instr:                          # dedupe identical instances
-            continue
-        gold = execute(plan)
-        if gold is None:
-            continue
-        gold_f = fmt(gold)
-        negs = pick_hard_negatives(plan, sorted(pool), gold_f, rng, k=args.k)
-        if len(negs) < args.k:                           # demand k verified negatives
-            continue
-        seen_instr.add(instr)
-        rows.append({
-            "id": f"syn_{idx:04d}",
-            "category": cat,
-            "instruction": instr,
-            "plan": plan,
-            "plan_str": plan_str(plan),
-            "answer": gold_f,
-            "hard_negatives": [
-                {"plan": c, "plan_str": plan_str(c), "answer": fmt(a)} for c, a in negs],
-            "checker_kind": "numeric",
-            "checker_args": {"canonical": {"value": float(gold_f)}, "match": {"tolerance": 0.01}},
-            "reward_path": "verifiable",
-        })
-        per[cat] += 1
-        idx += 1
+    rows, idx = generate_batch(rng, seen_instr, per, args.n, 0, args)
 
-    import os
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     print(f"wrote {len(rows)} rows -> {args.out}")
     print("per-category:", dict(per))
+
+    # holdout VALIDATION set: disjoint from train (shared seen_instr + continued rng), unique ids.
+    if args.val_n > 0:
+        os.makedirs(os.path.dirname(args.val_out), exist_ok=True)
+        val_rows, idx = generate_batch(rng, seen_instr, per, args.val_n, idx, args)
+        with open(args.val_out, "w") as f:
+            for r in val_rows:
+                f.write(json.dumps(r) + "\n")
+        train_instr = {r["instruction"] for r in rows}
+        val_instr = {r["instruction"] for r in val_rows}
+        assert train_instr.isdisjoint(val_instr), "train/val instruction overlap!"
+        print(f"wrote {len(val_rows)} VAL rows -> {args.val_out}  (disjoint from train, verified)")
+
 
 if __name__ == "__main__":
     main()

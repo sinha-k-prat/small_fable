@@ -175,6 +175,77 @@ def eval_held(model, tok, rows, args, device):
     return {"acc_plan": A, "neg_follow": B, "neg_to_gold": C, "acc_noplan": D, "ablation_gap": A - D}
 
 
+# --------------------------------------------------------------------------- val error + plotting
+@torch.no_grad()
+def val_answer_ce(model, tok, rows, args, device):
+    """Mean teacher-forced answer cross-entropy under the GOLD plan over `rows` — the val-error
+    scalar plotted against the training CE curve. Builds the SAME sequence training uses for the
+    gold variant (variants[0] in example_loss), so train CE and val CE are measured identically."""
+    if not rows:
+        return float("nan")
+    model.eval()
+    total, count = 0.0, 0
+    for i in range(0, len(rows), max(1, args.bs)):
+        chunk = rows[i:i + max(1, args.bs)]
+        seqs = [build_seq(tok, prompt_with_plan(r["instruction"], r["plan_str"]),
+                          target_text(r["answer"]), args.max_len) for r in chunk]
+        input_ids, labels, attn = collate(seqs, tok.pad_token_id, device)
+        with torch.autocast(device_type="cuda", dtype=args.amp_dtype, enabled=args.amp):
+            logits = model(input_ids=input_ids, attention_mask=attn).logits
+        ce = per_row_ce(logits, labels)
+        total += float(ce.sum()); count += ce.numel()
+    model.train()
+    return total / max(1, count)
+
+
+def plot_curves(history, out_png):
+    """Headless train-vs-val error curves. (A) train CE vs step + val CE markers; (B) causal metrics
+    vs epoch. Always dumps history.json; matplotlib import is GUARDED so a missing install only
+    warns (training never crashes)."""
+    hist_path = os.path.join(os.path.dirname(out_png) or ".", "history.json")
+    try:
+        json.dump(history, open(hist_path, "w"), indent=2)
+    except Exception as e:
+        print(f"[plot] WARNING: could not write {hist_path}: {e}")
+    try:
+        import matplotlib
+        matplotlib.use("Agg")                 # headless backend — set BEFORE importing pyplot
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[plot] WARNING: matplotlib unavailable ({e}); wrote {hist_path}, skipping PNG.")
+        return
+    ts, ve = history.get("train_steps", []), history.get("val_epochs", [])
+    fig, (axA, axB) = plt.subplots(2, 1, figsize=(9, 9), constrained_layout=True)
+    if ts:
+        axA.plot([d["step"] for d in ts], [d["ce"] for d in ts], "-o", ms=3, lw=1.5,
+                 color="tab:blue", label="train CE (gold plan)")
+    if ve:
+        axA.plot([d["step"] for d in ve], [d["val_ce"] for d in ve], "s--", ms=9, lw=1.0,
+                 color="tab:red", alpha=0.8, label="val CE (gold plan, teacher-forced)")
+    axA.set_xlabel("optimizer step"); axA.set_ylabel("cross-entropy (answer tokens)")
+    axA.set_title("(A) ERROR — train vs validation answer-CE under the GOLD plan")
+    axA.grid(True, alpha=0.3); axA.legend(loc="best")
+    if ve:
+        ep = [d["epoch"] for d in ve]
+        for key, lab, c in [("acc_plan", "acc_plan (gold-plan correct)", "tab:green"),
+                            ("neg_follow", "neg_follow (HIGH = plan causal)", "tab:orange"),
+                            ("neg_to_gold", "neg_to_gold (LOW = plan causal)", "tab:purple"),
+                            ("acc_noplan", "acc_noplan (no plan)", "tab:gray")]:
+            axB.plot(ep, [d[key] for d in ve], "-o", ms=4, color=c, label=lab)
+        axB.set_ylim(-0.02, 1.02); axB.set_xlabel("epoch"); axB.set_ylabel("rate")
+        axB.set_title("(B) CAUSAL — is the plan load-bearing? (neg_follow HIGH & neg_to_gold LOW)")
+        axB.grid(True, alpha=0.3); axB.legend(loc="best", fontsize=8)
+    else:
+        axB.text(0.5, 0.5, "no val_epochs recorded", ha="center", va="center")
+    try:
+        fig.savefig(out_png, dpi=130)
+        print(f"[plot] wrote {out_png} and {hist_path}")
+    except Exception as e:
+        print(f"[plot] WARNING: could not save {out_png}: {e}")
+    finally:
+        plt.close(fig)
+
+
 # --------------------------------------------------------------------------- driver
 def main():
     ap = argparse.ArgumentParser()
@@ -201,6 +272,10 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--eval_n", type=int, default=40)
+    ap.add_argument("--val", default="dataset/sft_synth_v4_val.jsonl",
+                    help="separate holdout VALIDATION file, disjoint from --data. When it exists, "
+                         "ALL its rows are used for eval_held AND the val_ce error curve; when "
+                         "absent, fall back to the internal held split (capped at --eval_n).")
     args = ap.parse_args()
 
     random.seed(args.seed); torch.manual_seed(args.seed)
@@ -245,13 +320,26 @@ def main():
     random.shuffle(rows)
     train_rows = rows[:args.train]
     held_rows = rows[args.train:args.train + args.held]
-    eval_rows = held_rows[:args.eval_n]
-    print(f"[ctr] train={len(train_rows)} held={len(held_rows)} eval_n={len(eval_rows)}")
+
+    # validation set: prefer the SEPARATE --val holdout file (disjoint from --data); ALL its rows
+    # feed BOTH eval_held (decode/causal metrics) and the val_ce error curve. Else fall back to the
+    # internal held split (capped at --eval_n).
+    if os.path.exists(args.val):
+        val_rows = [json.loads(l) for l in open(args.val)]
+        eval_rows = val_rows
+        print(f"[ctr] train={len(train_rows)} held={len(held_rows)} "
+              f"VAL(file={args.val})={len(val_rows)} -> eval on ALL {len(val_rows)} val rows")
+    else:
+        val_rows = held_rows[:args.eval_n]
+        eval_rows = val_rows
+        print(f"[ctr] train={len(train_rows)} held={len(held_rows)} "
+              f"VAL(file MISSING -> internal held split)={len(val_rows)}")
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "fp16"))
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr)
 
     model.train()
+    history = {"train_steps": [], "val_epochs": []}      # train CE per step + val metrics per epoch
     step = 0
     for ep in range(args.epochs):
         random.shuffle(train_rows)
@@ -272,14 +360,23 @@ def main():
             step += 1
             if step % 25 == 0:
                 n = max(1, agg["n"])
-                print(f"  ep{ep} step{step}  CE={agg['ce']/n:.3f}  InfoNCE={agg['infonce']/n:.3f}  "
-                      f"KL={agg['kl']/n:.3f}  gap(CEneg-CEpos)={agg['gap']/n:+.3f}")
+                ce_w, inf_w, kl_w, gap_w = agg["ce"]/n, agg["infonce"]/n, agg["kl"]/n, agg["gap"]/n
+                print(f"  ep{ep} step{step}  CE={ce_w:.3f}  InfoNCE={inf_w:.3f}  "
+                      f"KL={kl_w:.3f}  gap(CEneg-CEpos)={gap_w:+.3f}")
+                history["train_steps"].append({"step": step, "epoch": ep, "ce": ce_w,
+                                               "infonce": inf_w, "kl": kl_w, "gap": gap_w})
                 agg = {"ce": 0.0, "infonce": 0.0, "kl": 0.0, "gap": 0.0, "n": 0}
         ev = eval_held(model, tok, eval_rows, args, device)
         print(f"[ctr] epoch {ep} HELD  acc_plan={ev['acc_plan']:.2%}  neg_follow={ev['neg_follow']:.2%}  "
               f"neg_to_gold={ev['neg_to_gold']:.2%}  acc_noplan={ev['acc_noplan']:.2%}  "
               f"ablation_gap={ev['ablation_gap']:+.2%}   "
               f"[plan causal iff neg_follow HIGH & neg_to_gold LOW]")
+        val_ce = val_answer_ce(model, tok, val_rows, args, device)
+        print(f"[ctr] epoch {ep} VAL   val_ce(gold-plan, teacher-forced)={val_ce:.4f}")
+        history["val_epochs"].append({"epoch": ep, "step": step, "val_ce": val_ce,
+                                      "acc_plan": ev["acc_plan"], "neg_follow": ev["neg_follow"],
+                                      "neg_to_gold": ev["neg_to_gold"], "acc_noplan": ev["acc_noplan"],
+                                      "ablation_gap": ev["ablation_gap"]})
 
     os.makedirs(args.out, exist_ok=True)
     model.save_pretrained(args.out)
@@ -288,6 +385,7 @@ def main():
                "kl_ref": args.kl_ref, "k": args.k, "format": "Problem/Plan/FINAL ANSWER text prefix"},
               open(os.path.join(args.out, "config.json"), "w"), indent=2)
     print(f"[ctr] saved adapter -> {args.out}")
+    plot_curves(history, os.path.join(args.out, "curves.png"))
 
 
 if __name__ == "__main__":
