@@ -153,9 +153,14 @@ def eval_held(model, rows, max_resp, sample=False, temp=0.7):
     if not rows:
         return {}
     model.eval()
+    n_rows = len(rows)
+    print(f"[eval_held] running on {n_rows} examples × 3 decode passes "
+          f"(max_new_tokens={max_resp}) — may take several minutes ...", flush=True)
     pce_sum = rce_sum = 0.0
     corr_plan = corr_randplan = corr_noplan = 0.0
-    for r in rows:
+    for ri, r in enumerate(rows):
+        if ri > 0 and ri % 10 == 0:
+            print(f"[eval_held] {ri}/{n_rows} done ...", flush=True)
         p_ids, p_attn = model.batch_prompts([r["instruction"]])
         plan_ids = encode_plan(r["plan"], model.plan_max_len).unsqueeze(0).to(model.device)
         r_ids, r_attn = tok_answer(model, [r["answer"]], max_resp)
@@ -169,9 +174,9 @@ def eval_held(model, rows, max_resp, sample=False, temp=0.7):
                                        max_new_tokens=max_resp)
         g_none = model.generate_answer(p_ids, p_attn, None, sample=sample, temp=temp,
                                        max_new_tokens=max_resp)
-        corr_plan    += graded_reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
+        corr_plan     += graded_reward_for_row(r, model.tok.decode(g_plan[0], skip_special_tokens=True))
         corr_randplan += graded_reward_for_row(r, model.tok.decode(g_rand[0], skip_special_tokens=True))
-        corr_noplan  += graded_reward_for_row(r, model.tok.decode(g_none[0], skip_special_tokens=True))
+        corr_noplan   += graded_reward_for_row(r, model.tok.decode(g_none[0], skip_special_tokens=True))
     n = len(rows)
     acc_gold = corr_plan / n
     acc_rand = corr_randplan / n
@@ -309,7 +314,7 @@ def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
                 ckpt.save(model, _sft_state(ep, bi + 1, global_step, opt, sched, args, stage),
                           reason=f"{tag}-e{ep+1}-b{bi+1}")
         n = max(run["n"], 1)
-        held = eval_held(model, args._held_rows, args.max_resp, sample=args.eval_sample)
+        held = eval_held(model, args._eval_rows, args.max_resp, sample=args.eval_sample)
         torch.cuda.reset_peak_memory_stats()   # reset so next epoch peak is fresh
         print(f"[sft:{tag}] epoch {ep+1}/{epochs} ({time.time()-t0:.1f}s) "
               f"plan_ce={run['plan_ce']/n:.4f} resp_ce={run['resp_ce']/n:.4f} kl={run['kl']/n:.4f} "
@@ -369,6 +374,9 @@ def main():
                     help="model dtype: float32 | bfloat16 | auto (default: bfloat16 on CUDA, float32 on CPU)")
     ap.add_argument("--seed", type=int, default=20260616)
     ap.add_argument("--eval_sample", action="store_true")
+    ap.add_argument("--eval_held_max", type=int, default=30,
+                    help="max held examples used for per-epoch ablation-gap eval during training "
+                         "(full held set is used for the final report). 0 = use all held rows.")
     # A3 curriculum
     ap.add_argument("--curriculum", action="store_true", help="A3: two-stage broad->hard")
     ap.add_argument("--stage1_epochs", type=int, default=5)
@@ -401,6 +409,11 @@ def main():
     held_rows  = rows[args.train:args.train+args.held]
     probe_rows = held_rows[:args.probe] if args.probe else []
     args._held_rows = held_rows
+    # Subset used for fast per-epoch evals during training (full set used for final report).
+    _cap = args.eval_held_max if args.eval_held_max > 0 else len(held_rows)
+    args._eval_rows = held_rows[:_cap]
+    print(f"[sft] held={len(held_rows)} total  eval_held_max={_cap} "
+          f"(per-epoch evals use {_cap} rows; final report uses all {len(held_rows)})", flush=True)
     print(f"[sft] data={args.data} train={len(train_rows)} (expanded) held={len(held_rows)} base={args.base}")
 
     # ------------------------------------------------------------------
@@ -486,8 +499,9 @@ def main():
                 model, held_rows, args.max_turns, args.max_plan, args.max_resp,
                 sample=args.eval_sample, seed=args.seed)))
         else:
-            print("[sft] initial held:",
-                  json.dumps(eval_held(model, held_rows, args.max_resp, sample=args.eval_sample)))
+            print(f"[sft] initial held (fast subset, {len(args._eval_rows)} rows):",
+                  json.dumps(eval_held(model, args._eval_rows, args.max_resp,
+                                       sample=args.eval_sample)))
 
     final_held = None
 
