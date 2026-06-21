@@ -36,6 +36,14 @@ CLI:
 import argparse, json, time, csv
 import torch
 
+def _gpu_mem() -> str:
+    if not torch.cuda.is_available():
+        return ""
+    alloc = torch.cuda.memory_allocated() / 1e9
+    peak  = torch.cuda.max_memory_allocated() / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    return f"gpu: alloc={alloc:.1f}GB peak={peak:.1f}GB/{total:.0f}GB ({100*peak/total:.0f}%)"
+
 from model_joint import JointModel, PAD_ID, decode_plan
 from checkers import graded_reward_for_row
 from reward_paths import reward_path_for_row
@@ -251,7 +259,8 @@ def main():
                 dropped += 1
             if (ri + 1) % 10 == 0:
                 print(f"[rollout] {ri+1}/{len(rows)} mean_reward={rew_sum/(ri+1):.3f} "
-                      f"zero_var={zero_var}/{ri+1} dropped={dropped} ({time.time()-t0:.0f}s)")
+                      f"zero_var={zero_var}/{ri+1} dropped={dropped} ({time.time()-t0:.0f}s) "
+                      f"| {_gpu_mem()}")
 
     with open(args.report, "w", newline="") as rf:
         w = csv.writer(rf); w.writerow(["id", "reward_path", "p_q", "std", "kept"])

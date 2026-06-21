@@ -48,6 +48,14 @@ import argparse, json, copy, os, time
 from collections import Counter
 import torch, torch.nn.functional as F
 
+def _gpu_mem() -> str:
+    if not torch.cuda.is_available():
+        return ""
+    alloc = torch.cuda.memory_allocated() / 1e9
+    peak  = torch.cuda.max_memory_allocated() / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    return f"gpu: alloc={alloc:.1f}GB peak={peak:.1f}GB/{total:.0f}GB ({100*peak/total:.0f}%)"
+
 from model_joint import JointModel, encode_plan, PAD_ID, decode_plan, N_PLAN
 from grpo_offpolicy import (joint_grpo_loss, mgpo_weight, variance_weight, group_pq,
                             long2short_shape)
@@ -470,6 +478,7 @@ def main():
         wv = sum(w_by_path["verifiable"])/max(1, len(w_by_path["verifiable"]))
         wr = sum(w_by_path["rubric"])/max(1, len(w_by_path["rubric"]))
         plan_ent = agg["plan_entropy"]/n
+        torch.cuda.reset_peak_memory_stats()
         print(f"[grpo] inner_epoch {ie+1}/{args.inner_epochs} ({time.time()-t0:.1f}s) "
               f"loss={agg['total_loss']/n:.4f} l_exec={agg['l_exec']/n:.4f} "
               f"exec_approx_kl={ekl:.4f} exec_clip_frac={agg['exec_clip_frac']/n:.3f} "
@@ -477,7 +486,7 @@ def main():
               + (f"held_reward={hr:.3f} " if hr is not None else "")
               + f"executor={'FROZEN' if args.freeze_executor else 'trainable'} "
               + f"| mean_w(verif)={wv:.2f} mean_w(rubric)={wr:.2f} "
-              f"p_q_hist[0-1]={pq_hist(pqs)}")
+              f"p_q_hist[0-1]={pq_hist(pqs)} | {_gpu_mem()}")
         # end-of-inner-epoch checkpoint: next position = (ie+1, 0)
         ckpt.save(model, _grpo_state(ie + 1, 0, global_step, opt, args), reason=f"grpo-inner{ie+1}")
         if ekl > args.kl_stop:

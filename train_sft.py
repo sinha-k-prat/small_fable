@@ -50,6 +50,16 @@ import argparse, json, math, os, random, time
 import torch, torch.nn.functional as F
 
 import random as _random_mod
+
+def _gpu_mem() -> str:
+    """One-line GPU memory summary: alloc / peak / total in GB with % used."""
+    if not torch.cuda.is_available():
+        return ""
+    alloc = torch.cuda.memory_allocated() / 1e9
+    peak  = torch.cuda.max_memory_allocated() / 1e9
+    total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    pct   = 100 * peak / total
+    return f"gpu: alloc={alloc:.1f}GB peak={peak:.1f}GB/{total:.0f}GB ({pct:.0f}%)"
 from model_joint import JointModel, encode_plan, decode_plan, PAD_ID, N_PLAN
 from checkers import graded_reward_for_row
 from checkpointing import (Checkpointer, load_train_state, restore_optimizer, restore_rng,
@@ -300,9 +310,10 @@ def run_stage(model, opt, sched, stage_rows, epochs, args, tag,
                           reason=f"{tag}-e{ep+1}-b{bi+1}")
         n = max(run["n"], 1)
         held = eval_held(model, args._held_rows, args.max_resp, sample=args.eval_sample)
+        torch.cuda.reset_peak_memory_stats()   # reset so next epoch peak is fresh
         print(f"[sft:{tag}] epoch {ep+1}/{epochs} ({time.time()-t0:.1f}s) "
               f"plan_ce={run['plan_ce']/n:.4f} resp_ce={run['resp_ce']/n:.4f} kl={run['kl']/n:.4f} "
-              f"| held {json.dumps(held)}")
+              f"| held {json.dumps(held)} | {_gpu_mem()}")
         if getattr(args, "metrics_out", None):
             rec = {"tag": tag, "epoch": ep + 1, "time_s": round(time.time() - t0, 1),
                    "train_plan_ce": round(run["plan_ce"]/n, 4),
