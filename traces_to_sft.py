@@ -170,6 +170,7 @@ def main():
     args = ap.parse_args()
     import os
     os.makedirs(os.path.dirname(args.out) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(args.vocab_out) or '.', exist_ok=True)
 
     key = {}                                               # instruction -> answer-key row
     for path in args.answers:
