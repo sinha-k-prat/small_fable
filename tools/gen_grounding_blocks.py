@@ -143,17 +143,17 @@ def f_constraint_select(rng):
     ]
 
     def club2_block(gi, idxs, which):
-        if idxs == (0, 1):
+        if idxs == (0,):
             if which == "neg":
-                return ("Keep only the items that FAIL the 1st stated requirement, then from those "
-                        "keep only the items that satisfy the 2nd stated requirement.")
-            return ("Keep only the items that satisfy the 1st stated requirement, then from those "
-                    "keep only the items that satisfy the 2nd stated requirement.")
-        return "Among the remaining items, select the one matching the stated preference."
+                return "Keep only the items that FAIL the 1st stated requirement."
+            return "Keep only the items that satisfy the 1st stated requirement."
+        # (1,2): FILTER + SELECT clubbed — two DIFFERENT primitives in one block
+        return ("From those, keep only the items that satisfy the 2nd stated requirement, then "
+                "select the one matching the stated preference.")
 
     spec = {"topic": "constraint_select", "problem": problem, "ops": ops,
             "init": list(prods), "finalize": lambda x: str(x),
-            "club2_groups": [(0, 1), (2,)], "club2_block": club2_block}
+            "club2_groups": [(0,), (1, 2)], "club2_block": club2_block}
     spec["checker"] = choice_checker(_build_answer(spec, perturb=False))
     return spec
 
@@ -397,16 +397,16 @@ def f_multi_hop_lookup(rng):
     ]
 
     def club2_block(gi, idxs, which):
-        if idxs == (0, 1):
-            if which == "neg":
-                return ("Resolve the stated start key through the 1st stated mapping, then SKIP the "
-                        "2nd stated mapping and keep that result unchanged.")
-            return ("Resolve the stated start key through the 1st stated mapping, then resolve that "
-                    "result through the 2nd stated mapping.")
-        return "Report that final value."
+        if idxs == (0,):
+            return "Resolve the stated start key through the 1st stated mapping."
+        # (1,2): LOOKUP + REPORT clubbed — two DIFFERENT primitives in one block
+        if which == "neg":
+            return ("Skip the 2nd stated mapping and keep the result from the 1st mapping "
+                    "unchanged, then report that final value.")
+        return "Resolve that result through the 2nd stated mapping, then report that final value."
 
     spec = {"topic": "multi_hop_lookup", "problem": problem, "ops": ops, "init": None,
-            "finalize": lambda x: str(x), "club2_groups": [(0, 1), (2,)], "club2_block": club2_block}
+            "finalize": lambda x: str(x), "club2_groups": [(0,), (1, 2)], "club2_block": club2_block}
     gold = _build_answer(spec, perturb=False)
     neg = _build_answer(spec, perturb=True)
     if gold == neg:
@@ -450,16 +450,16 @@ def f_conditional_reco(rng):
     ]
 
     def club2_block(gi, idxs, which):
-        if idxs == (0, 1):
+        if idxs == (0,):
             if which == "neg":
-                return ("Read the 1st stated condition as the OPPOSITE of what is given, "
-                        "then read the 2nd stated condition as given.")
-            return ("Read the 1st stated condition as given, then read the 2nd "
-                    "stated condition as given.")
-        return "Match both stated conditions in the table and report the single item."
+                return "Read the 1st stated condition as the OPPOSITE of what is given."
+            return "Read the 1st stated condition as given."
+        # (1,2): BRANCH + MATCH clubbed — two DIFFERENT primitives in one block
+        return ("Read the 2nd stated condition as given, then match both stated conditions in the "
+                "table and report the single item.")
 
     spec = {"topic": "conditional_reco", "problem": problem, "ops": ops, "init": None,
-            "finalize": lambda x: str(x), "club2_groups": [(0, 1), (2,)], "club2_block": club2_block}
+            "finalize": lambda x: str(x), "club2_groups": [(0,), (1, 2)], "club2_block": club2_block}
     gold = _build_answer(spec, perturb=False)
     neg = _build_answer(spec, perturb=True)
     if gold == neg:
