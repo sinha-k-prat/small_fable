@@ -162,7 +162,11 @@ def match_answer(decoded, reference, tol=0.01):
 def grade(decoded, reference, row, want="gold"):
     """Prefer the row's own checker (checkers.reward_for_row) when present so grading is identical
     to the rest of the repo; else use the built-in judge-free comparator. For neg_follow we must
-    grade against neg_answer, so we swap the checker's canonical/gold to the neg reference."""
+    grade against neg_answer, so we swap the checker's canonical/gold to the neg reference.
+    REQUIRES a committed 'FINAL ANSWER:' marker — an uncommitted (e.g. truncated) decode scores 0,
+    never a tail/last-line match (that fallback manufactures false positives on reasoning text)."""
+    if not _FINAL_RE.search(str(decoded)):
+        return 0.0
     ck = row.get("checker_kind")
     if ck:
         try:
@@ -283,7 +287,9 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--limit", type=int, default=0, help="cap rows (0 = all)")
     ap.add_argument("--out", default="grounding_out")
-    ap.add_argument("--max_new_tokens", type=int, default=24)
+    ap.add_argument("--max_new_tokens", type=int, default=320,
+                    help="must be large enough for the verbose CoT to reach FINAL ANSWER: — watch "
+                         "marker_rate in the summary (want >=0.9); raise this if it's low.")
     args = ap.parse_args()
 
     import torch
@@ -326,6 +332,7 @@ def main():
     per_topic = collections.defaultdict(_agg)
     per_turns = collections.defaultdict(_agg)
     examples = []
+    marker_hits = marker_total = 0          # fraction of decodes that reached FINAL ANSWER: (truncation check)
 
     for i, r in enumerate(rows):
         setup   = r["problem"]                      # dataset field names (gen_grounding_data.py)
@@ -348,6 +355,11 @@ def main():
             neg_to_gold = grade(d_neg, gold, r, want="gold")
         else:
             d_neg, neg_follow, neg_to_gold = "", 0.0, 0.0
+
+        for dtxt in (d_plan, d_noplan, d_neg):     # marker_rate: did the decode actually commit?
+            if dtxt != "":
+                marker_total += 1
+                marker_hits += 1 if _FINAL_RE.search(dtxt) else 0
 
         for agg in (overall, per_topic[topic], per_turns[n_turns]):
             agg["acc_plan"]    += acc_plan
@@ -378,10 +390,11 @@ def main():
     grounds = (metrics["neg_follow"] >= 0.50) and (metrics["neg_to_gold"] <= 0.30)
     verdict = ("GROUNDING WORKS" if grounds else "GROUNDING WEAK/ABSENT")
 
+    marker_rate = marker_hits / max(1, marker_total)
     results = {
         "base": args.base, "data": args.data, "n_rows": overall["n"],
         "dtype": args.dtype, "device": device, "max_new_tokens": args.max_new_tokens,
-        "chat_template": has_ct,
+        "chat_template": has_ct, "marker_rate": marker_rate,
         "overall": metrics, "per_topic": pt, "per_turn_count": ptc,
         "verdict": verdict,
         "verdict_rule": "grounding iff neg_follow>=0.50 AND neg_to_gold<=0.30",
@@ -395,6 +408,8 @@ def main():
 
     print("\n==================== GROUNDING PROBE SUMMARY ====================")
     print(f"  rows={overall['n']}  base={args.base}  ({args.dtype}/{device})")
+    flag = "" if marker_rate >= 0.9 else "  <-- LOW: raise --max_new_tokens; metrics below are unreliable"
+    print(f"  marker_rate (decodes reaching FINAL ANSWER:) {marker_rate:.0%}{flag}")
     print(f"  acc_plan   (gold-plan -> gold) ........ {metrics['acc_plan']:.2%}")
     print(f"  neg_follow (neg-plan  -> neg)  HIGH=good {metrics['neg_follow']:.2%}")
     print(f"  neg_to_gold(neg-plan  -> gold) LOW=good  {metrics['neg_to_gold']:.2%}")
