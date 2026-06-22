@@ -50,7 +50,7 @@ Output row schema (consumed by grounding_test.py + checkers.reward_for_row):
 
 stdlib-only, fully seeded.
 """
-import argparse, collections, json, os, random
+import argparse, collections, json, os, random, re
 
 
 # =========================================================================== checker helpers
@@ -244,8 +244,10 @@ def f_categorize_rule(rng):
         if val <= b:  return b_mid
         return b_hi
 
+    # NB: the bucket words live in the PROBLEM (the rule defines them); the plan must NOT list them,
+    # or it would hand the executor the answer set instead of steering it to compute the bucket.
     gold_plan = ["Compare the reading to the two thresholds in the rule.",
-                 f"Report the matching category word ({b_lo}, {b_mid}, or {b_hi})."]
+                 "State the category whose range the reading falls into."]
     gold = classify(flip=False)
     neg_plan = list(gold_plan)
     neg_plan[0] = "Compare the reading to the two thresholds, but swap which threshold is which."
@@ -354,6 +356,17 @@ def build_row(rng, idx, target_turns, fam):
         return None
     gold_plan, neg_plan = trim_to_turns(gold_plan, neg_plan, target_turns)
     if not (2 <= len(gold_plan) <= 5):
+        return None
+
+    # STEERING, NOT STATING: the plan describes the PROCEDURE; the answer must be derived by
+    # executing it over the problem data, never named in the plan itself. Reject any row whose
+    # answer content-word appears in its own plan (so 'following' can't degenerate to copying).
+    _stop = {"the", "a", "an", "to", "is", "of", "and", "or", "then", "it", "in", "by", "into"}
+    def _content(s):
+        return {w for w in re.sub(r"[^a-z0-9 ]", " ", str(s).lower()).split() if w not in _stop}
+    if _content(gold) & {w for t in gold_plan for w in _content(t)}:
+        return None
+    if _content(neg) & {w for t in neg_plan for w in _content(t)}:
         return None
 
     return {
