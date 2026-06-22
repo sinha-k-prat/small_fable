@@ -22,23 +22,24 @@ data: dataset/traces_sft.jsonl
 train: 1800
 held: 200
 dtype: bfloat16
-bs: 16
-lr: 2.0e-5
-lr_min: 8.0e-8
+bs: 128          # A100 80GB: bs=16 used only 4% GPU; bs=128 targets ~30%
+lr: 1.6e-4       # linear scaling rule: 2e-5 × (128/16) = 1.6e-4
+lr_min: 8.0e-7
 warmup_frac: 0.05
 lam_resp: 1.0
-lam_kl: 1.5    # raised from 0.1 — old run hit KL=1.82 by epoch 3, destroying instruction-following
+lam_kl: 1.5
 max_resp: 256
 plan_max_len: 24
 out: joint_ckpt
 device: cuda
 seed: 20260616
-eval_sample: false        # set true to use sampling during held eval (slower but less greedy bias)
+eval_sample: false
 
-# A3 curriculum
+# A3 curriculum — epoch counts scaled up: with bs=128 there are only 15 batches/epoch
+# (vs 113 with bs=16), so we need more epochs to get comparable gradient steps.
 curriculum: true
-stage1_epochs: 4
-stage2_epochs: 2
+stage1_epochs: 8    # 8×15 = 120 steps  (vs 4×113 = 452 with bs=16)
+stage2_epochs: 6    # 6×~3 = ~18 steps on hard subset
 hard_err_rate: 0.75       # keep prompts solved ≤ (1−0.75)×8 = 2/8 times
 hard_samples: 8
 
