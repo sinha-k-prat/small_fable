@@ -55,29 +55,46 @@ SYS_MSG = (
     "write the marker 'FINAL ANSWER:' followed by the single final answer and nothing else after it."
 )
 
+# Per-topic answer cue: commit the ENTITY the question asks for, not a value computed en route
+# (fixes the 'cheapest is Onyx ... FINAL ANSWER: $35' artifact where grounding succeeded but the
+# wrong field was committed). Keyed by the dataset's `topic`.
+TOPIC_CUE = {
+    "constraint_select": "the NAME of the single chosen item (a word, not its price or any number)",
+    "comparison_order":  "the full ordering of names using '<', e.g. 'A < B < C'",
+    "set_ops":           "the single person's NAME (one word)",
+    "transitive_logic":  "the single player's NAME (one word)",
+    "scheduling":        "the single step word (one word)",
+    "categorize_rule":   "the single category word (one word)",
+    "multi_hop_lookup":  "the single final value (one word)",
+    "conditional_reco":  "the single recommended item's NAME (one word)",
+}
+
 def _format_turns(turns):
     return "\n".join(f"{i+1}. {t}" for i, t in enumerate(turns))
 
-def user_with_plan(setup, turns):
+def _cue(cue):
+    return f" Your final answer must be {cue}." if cue else ""
+
+def user_with_plan(setup, turns, cue=""):
     return (
         f"PROBLEM:\n{setup}\n\n"
         f"PLAN (follow these turns in order, exactly):\n{_format_turns(turns)}\n\n"
-        f"Work through the plan one turn at a time, then on a new line write:\n"
-        f"FINAL ANSWER:"
+        f"Work through the plan one turn at a time.{_cue(cue)}\n"
+        f"Then on a new line write:\nFINAL ANSWER:"
     )
 
-def user_no_plan(setup):
+def user_no_plan(setup, cue=""):
     return (
         f"PROBLEM:\n{setup}\n\n"
-        f"Solve it step by step, then on a new line write:\n"
-        f"FINAL ANSWER:"
+        f"Solve it step by step.{_cue(cue)}\n"
+        f"Then on a new line write:\nFINAL ANSWER:"
     )
 
-def build_prompt(tok, setup, turns, use_chat_template=True):
+def build_prompt(tok, setup, turns, cue="", use_chat_template=True):
     """Render to a single prompt string. For an Instruct model we use
     tokenizer.apply_chat_template(..., add_generation_prompt=True); fall back to a plain template
     only if the tokenizer has no chat template (e.g. a base, non-instruct model)."""
-    user = user_no_plan(setup) if turns is None else user_with_plan(setup, turns)
+    user = user_no_plan(setup, cue) if turns is None else user_with_plan(setup, turns, cue)
     if use_chat_template and getattr(tok, "chat_template", None):
         msgs = [{"role": "system", "content": SYS_MSG},
                 {"role": "user", "content": user}]
@@ -331,6 +348,7 @@ def main():
     overall = _agg()
     per_topic = collections.defaultdict(_agg)
     per_turns = collections.defaultdict(_agg)
+    cond = _agg()                           # CONDITIONAL: only rows the model FAILS unaided (acc_noplan==0)
     examples = []
     marker_hits = marker_total = 0          # fraction of decodes that reached FINAL ANSWER: (truncation check)
 
@@ -342,15 +360,16 @@ def main():
         nturns  = r.get("neg_plan", None)
         topic   = r.get("topic", r.get("category", "unknown"))
         n_turns = int(r.get("n_turns", len(gturns)))
+        cue     = TOPIC_CUE.get(topic, "")          # commit the asked-for entity, not a derived value
 
-        d_plan   = decode(build_prompt(tok, setup, gturns, has_ct))
-        d_noplan = decode(build_prompt(tok, setup, None,   has_ct))
+        d_plan   = decode(build_prompt(tok, setup, gturns, cue, has_ct))
+        d_noplan = decode(build_prompt(tok, setup, None,   cue, has_ct))
 
         acc_plan   = grade(d_plan,   gold, r, want="gold")
         acc_noplan = grade(d_noplan, gold, r, want="gold")
 
         if nturns is not None and neg is not None:
-            d_neg = decode(build_prompt(tok, setup, nturns, has_ct))
+            d_neg = decode(build_prompt(tok, setup, nturns, cue, has_ct))
             neg_follow  = grade(d_neg, neg,  r, want="neg")
             neg_to_gold = grade(d_neg, gold, r, want="gold")
         else:
@@ -361,7 +380,10 @@ def main():
                 marker_total += 1
                 marker_hits += 1 if _FINAL_RE.search(dtxt) else 0
 
-        for agg in (overall, per_topic[topic], per_turns[n_turns]):
+        aggs = [overall, per_topic[topic], per_turns[n_turns]]
+        if acc_noplan == 0.0:                      # plan-causation is only testable when it's NEEDED
+            aggs.append(cond)
+        for agg in aggs:
             agg["acc_plan"]    += acc_plan
             agg["neg_follow"]  += neg_follow
             agg["neg_to_gold"] += neg_to_gold
@@ -384,11 +406,16 @@ def main():
     metrics   = _finalize(overall)
     pt        = {k: _finalize(v) for k, v in per_topic.items()}
     ptc       = {int(k): _finalize(v) for k, v in per_turns.items()}
+    condm     = _finalize(cond)             # metrics over rows the model FAILS unaided
 
-    # VERDICT — grounding works iff the wrong plan DRAGS the model to the wrong answer (high neg_follow)
-    # AND the model does not just ignore the plan (low neg_to_gold).
-    grounds = (metrics["neg_follow"] >= 0.50) and (metrics["neg_to_gold"] <= 0.30)
-    verdict = ("GROUNDING WORKS" if grounds else "GROUNDING WEAK/ABSENT")
+    # VERDICT — judge grounding ONLY on rows where the plan is load-bearing (the model can't solve
+    # unaided). On rows it solves anyway, a wrong plan is correctly overridden, which looks like
+    # 'ignoring' but isn't a grounding failure. So the honest test is the CONDITIONAL one.
+    def _grounds(m):
+        return (m["neg_follow"] >= 0.50) and (m["neg_to_gold"] <= 0.30)
+    grounds_cond = cond["n"] >= 10 and _grounds(condm)
+    verdict = ("GROUNDING WORKS" if grounds_cond else "GROUNDING WEAK/ABSENT")
+    raw_verdict = ("GROUNDING WORKS" if _grounds(metrics) else "GROUNDING WEAK/ABSENT")
 
     marker_rate = marker_hits / max(1, marker_total)
     results = {
@@ -396,8 +423,10 @@ def main():
         "dtype": args.dtype, "device": device, "max_new_tokens": args.max_new_tokens,
         "chat_template": has_ct, "marker_rate": marker_rate,
         "overall": metrics, "per_topic": pt, "per_turn_count": ptc,
-        "verdict": verdict,
-        "verdict_rule": "grounding iff neg_follow>=0.50 AND neg_to_gold<=0.30",
+        "conditional": condm, "conditional_n": cond["n"],
+        "verdict": verdict, "raw_verdict": raw_verdict,
+        "verdict_rule": "CONDITIONAL: among rows the model fails unaided, grounding iff "
+                        "neg_follow>=0.50 AND neg_to_gold<=0.30 (n>=10)",
         "examples": examples,
     }
     res_path = os.path.join(args.out, "results.json")
@@ -410,10 +439,15 @@ def main():
     print(f"  rows={overall['n']}  base={args.base}  ({args.dtype}/{device})")
     flag = "" if marker_rate >= 0.9 else "  <-- LOW: raise --max_new_tokens; metrics below are unreliable"
     print(f"  marker_rate (decodes reaching FINAL ANSWER:) {marker_rate:.0%}{flag}")
-    print(f"  acc_plan   (gold-plan -> gold) ........ {metrics['acc_plan']:.2%}")
-    print(f"  neg_follow (neg-plan  -> neg)  HIGH=good {metrics['neg_follow']:.2%}")
-    print(f"  neg_to_gold(neg-plan  -> gold) LOW=good  {metrics['neg_to_gold']:.2%}")
-    print(f"  acc_noplan (no-plan   -> gold) ........ {metrics['acc_noplan']:.2%}")
+    print(f"  RAW (all rows):")
+    print(f"    acc_plan   (gold-plan -> gold) ........ {metrics['acc_plan']:.2%}")
+    print(f"    neg_follow (neg-plan  -> neg)  HIGH=good {metrics['neg_follow']:.2%}")
+    print(f"    neg_to_gold(neg-plan  -> gold) LOW=good  {metrics['neg_to_gold']:.2%}")
+    print(f"    acc_noplan (no-plan   -> gold) ........ {metrics['acc_noplan']:.2%}")
+    print(f"  CONDITIONAL (only the {cond['n']} rows the model FAILS unaided — the honest test):")
+    print(f"    acc_plan   (plan rescues it) ......... {condm['acc_plan']:.2%}")
+    print(f"    neg_follow (follows wrong plan) HIGH=good {condm['neg_follow']:.2%}")
+    print(f"    neg_to_gold(ignores plan)       LOW=good  {condm['neg_to_gold']:.2%}")
     print("  per-topic:")
     for t in sorted(pt):
         m = pt[t]
@@ -424,7 +458,9 @@ def main():
         m = ptc[t]
         print(f"    {t}-turn  n={m['n']:<3} plan={m['acc_plan']:.0%} "
               f"follow={m['neg_follow']:.0%} to_gold={m['neg_to_gold']:.0%} noplan={m['acc_noplan']:.0%}")
-    print(f"\n  VERDICT: {verdict}   [{results['verdict_rule']}]")
+    print(f"\n  VERDICT (conditional, honest): {verdict}")
+    print(f"  raw verdict (all rows, confounded by easy problems): {raw_verdict}")
+    print(f"  rule: {results['verdict_rule']}")
     print("================================================================")
 
 

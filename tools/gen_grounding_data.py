@@ -96,7 +96,7 @@ def pick(rng, pool, k):
 def f_constraint_select(rng):
     """Catalog of products with boolean features + a price; gold filters then picks by a rule;
     neg flips one filter (or the pick rule) so a different product survives/wins."""
-    prods = pick(rng, PRODUCTS, rng.randint(4, 5))
+    prods = pick(rng, PRODUCTS, rng.randint(6, 8))   # bigger catalog -> harder to solve unaided
     feats = {p: {"waterproof": rng.random() < 0.5,
                  "wireless": rng.random() < 0.5,
                  "price": rng.randrange(20, 80, 5)} for p in prods}
@@ -183,7 +183,7 @@ def f_set_ops(rng):
 def f_transitive_logic(rng):
     """A chain of pairwise 'X beat Y' facts gives a total order; gold follows the chain to the
     overall winner, neg follows it to the overall loser."""
-    players = pick(rng, NAMES, rng.randint(4, 5))
+    players = pick(rng, NAMES, rng.randint(6, 7))     # longer chain -> harder to solve unaided
     rng.shuffle(players)                               # players[0] strongest ... [-1] weakest
     facts = [f"{players[i]} beat {players[i+1]}" for i in range(len(players) - 1)]
     rng.shuffle(facts)
