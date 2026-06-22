@@ -85,6 +85,30 @@ STRUCT_OK = {
     "written", "but", "asking", "than", "states",
 }
 STRUCT_OK |= {"4th", "5th", "fourth", "fifth"}
+# Clearer/fuller generic phrasing vocabulary (v2.1) — all structural, NO domain content.
+STRUCT_OK |= {
+    "go", "going", "drop", "meet", "meets", "do", "does", "doing", "again", "kept", "best",
+    "sort", "sorts", "sorted", "named", "names", "naming", "direction", "writes", "writing",
+    "relationship", "work", "works", "working", "exactly", "selects", "select", "selecting",
+    "ignore", "instead", "links", "link", "linked", "follow", "follows", "following", "other",
+    "ranking", "rank", "ranked", "everyone", "fact", "says", "say", "must", "come", "comes",
+    "arrange", "arranged", "sequence", "obeys", "obey", "every", "take", "takes", "taking",
+    "starting", "look", "looks", "looking", "find", "finds", "finding", "value", "values",
+    "next", "simply", "already", "sorting", "category", "using", "use", "uses", "cut", "off",
+    "points", "point", "compare", "compares", "compared", "against", "writes", "swap", "before",
+    "falls", "into", "condition", "conditions", "row", "rows", "table", "tables", "gives",
+    "give", "given", "gave", "report", "reports", "reporting", "person", "people", "found",
+    "selected", "different", "opposite", "what", "together", "matching", "matches", "key",
+    "mapping", "mappings", "list", "lists", "remove", "removes", "removed", "others", "remain",
+    "remaining", "pick", "picks", "picked", "single", "satisfy", "satisfies", "meet", "those",
+    "rule", "rules", "step", "steps", "end", "ends", "target", "between", "two", "one", "first",
+    "second", "third", "all", "also", "again", "an", "you", "your", "it", "its", "them", "their",
+    "this", "that", "these", "through", "out", "in", "the", "a", "of", "to", "and", "then",
+    "name", "attribute", "preference", "requirement", "requirements", "items", "item", "side",
+    "ordering", "order", "valid", "way", "stated", "states", "state", "problem", "question",
+    "wrote", "written", "each", "another", "from", "with", "as", "at", "is", "are", "not", "no",
+    "putting", "now", "still", "left", "they", "just", "lowest", "if", "says",
+}
 
 
 def _generic_violations(block):
@@ -133,23 +157,30 @@ def f_constraint_select(rng):
         return "none" if not s else sorted(s, key=lambda p: (feats[p]["price"], p))[0]
 
     ops = [
-        {"gold": "Keep only the items that satisfy the 1st stated requirement.",
-         "neg": "Keep only the items that fail the 1st stated requirement.",
+        {"gold": "Go through the list of items one by one, and keep only the items that meet the "
+                 "first requirement stated in the problem. Remove all the items that do not meet it.",
+         "neg": "Go through the list of items one by one, and keep only the items that do NOT meet "
+                "the first requirement stated in the problem. Remove all the items that do meet it.",
          "apply": keep_req1, "neg_apply": keep_req1_neg},
-        {"gold": "From those, keep only the items that satisfy the 2nd stated requirement.",
+        {"gold": "From the items you just kept, keep only the items that also meet the second "
+                 "requirement stated in the problem, and remove the others.",
          "neg": None, "apply": keep_req2, "neg_apply": keep_req2},
-        {"gold": "Among the remaining items, select the one matching the stated preference.",
+        {"gold": "Among the items that are still left, pick the single item that best matches the "
+                 "preference stated in the problem.",
          "neg": None, "apply": select_pref, "neg_apply": select_pref},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0,):
             if which == "neg":
-                return "Keep only the items that FAIL the 1st stated requirement."
-            return "Keep only the items that satisfy the 1st stated requirement."
+                return ("Go through the list of items one by one, and keep only the items that do "
+                        "NOT meet the first requirement stated in the problem; remove the others.")
+            return ("Go through the list of items one by one, and keep only the items that meet the "
+                    "first requirement stated in the problem; remove the others.")
         # (1,2): FILTER + SELECT clubbed — two DIFFERENT primitives in one block
-        return ("From those, keep only the items that satisfy the 2nd stated requirement, then "
-                "select the one matching the stated preference.")
+        return ("From the items you kept, keep only the items that also meet the second requirement "
+                "stated in the problem, and then among the items still left pick the single item "
+                "that best matches the stated preference.")
 
     spec = {"topic": "constraint_select", "problem": problem, "ops": ops,
             "init": list(prods), "finalize": lambda x: str(x),
@@ -173,20 +204,25 @@ def f_comparison_order(rng):
     def emit(s): return " < ".join(s)
 
     ops = [
-        {"gold": "Arrange the items by the stated attribute in the stated order.",
-         "neg": "Arrange the items by the stated attribute in the opposite of the stated order.",
+        {"gold": "Sort all of the items by the attribute named in the problem, going in the "
+                 "direction the problem states (lowest value first if it says ascending).",
+         "neg": "Sort all of the items by the attribute named in the problem, but going in the "
+                "OPPOSITE direction to the one the problem states.",
          "apply": sort_asc, "neg_apply": sort_desc},
-        {"gold": "Write them in that order, separated by the '<' symbol.",
+        {"gold": "Now write the items out in that sorted order, putting the '<' symbol between each "
+                 "one and the next.",
          "neg": None, "apply": emit, "neg_apply": emit},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0, 1):
             if which == "neg":
-                return ("Arrange the items by the stated attribute in the OPPOSITE of the stated "
-                        "order, then write them in that order separated by the '<' symbol.")
-            return ("Arrange the items by the stated attribute in the stated order, then write them "
-                    "in that order separated by the '<' symbol.")
+                return ("Sort all of the items by the attribute named in the problem in the OPPOSITE "
+                        "direction to the one stated, and then write them out in that sorted order "
+                        "putting the '<' symbol between each one and the next.")
+            return ("Sort all of the items by the attribute named in the problem in the stated "
+                    "direction, and then write them out in that sorted order putting the '<' symbol "
+                    "between each one and the next.")
         raise AssertionError("unexpected group")
 
     spec = {"topic": "comparison_order", "problem": problem, "ops": ops,
@@ -212,20 +248,23 @@ def f_set_ops(rng):
     def report(s): return s
 
     ops = [
-        {"gold": "Apply the stated relation between the two member lists to get the matching people.",
-         "neg": "Apply a DIFFERENT relation than the stated one between the two member lists.",
+        {"gold": "The problem names one relation between the two member lists. Work out exactly "
+                 "which people that stated relation selects.",
+         "neg": "Ignore the stated relation. Instead, work out which people a DIFFERENT relation "
+                "between the two member lists selects.",
          "apply": compute, "neg_apply": compute_neg},
-        {"gold": "Report the single person you found.",
+        {"gold": "Report the single person you selected.",
          "neg": None, "apply": report, "neg_apply": report},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0, 1):
             if which == "neg":
-                return ("Apply a DIFFERENT relation than the stated one between the two member "
-                        "lists, then report the single person you found.")
-            return ("Apply the stated relation between the two member lists, then report the single "
-                    "person you found.")
+                return ("Ignore the stated relation and instead work out which people a DIFFERENT "
+                        "relation between the two member lists selects, and then report the single "
+                        "person you selected.")
+            return ("Work out exactly which people the stated relation between the two member lists "
+                    "selects, and then report the single person you selected.")
         raise AssertionError
 
     spec = {"topic": "set_ops", "problem": problem, "ops": ops, "init": None,
@@ -249,22 +288,25 @@ def f_transitive_logic(rng):
     def report(s): return order_hi if s == ("hi",) else order_lo
 
     ops = [
-        {"gold": "Chain the stated relation across all the facts to order everyone, then take the "
-                 "stated target end.",
-         "neg": "Chain the stated relation across all the facts to order everyone, then take the "
-                "OPPOSITE end from the stated target.",
+        {"gold": "Each fact links two people by the stated relation. Follow the links from one end "
+                 "to the other to put everyone into a single ranking, and then take the person at "
+                 "the stated target end of that ranking.",
+         "neg": "Each fact links two people by the stated relation. Follow the links to put everyone "
+                "into a single ranking, and then take the person at the OPPOSITE end from the stated "
+                "target.",
          "apply": chain, "neg_apply": chain_neg},
-        {"gold": "Report the single person at that end.",
+        {"gold": "Report that single person.",
          "neg": None, "apply": report, "neg_apply": report},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0, 1):
             if which == "neg":
-                return ("Chain the stated relation to order everyone, take the OPPOSITE end from "
-                        "the stated target, then report the single person at that end.")
-            return ("Chain the stated relation to order everyone, take the stated target end, then "
-                    "report the single person at that end.")
+                return ("Follow the links in the facts to put everyone into a single ranking, take "
+                        "the person at the OPPOSITE end from the stated target, and then report that "
+                        "single person.")
+            return ("Follow the links in the facts to put everyone into a single ranking, take the "
+                    "person at the stated target end, and then report that single person.")
         raise AssertionError
 
     spec = {"topic": "transitive_logic", "problem": problem, "ops": ops, "init": None,
@@ -288,22 +330,25 @@ def f_scheduling(rng):
     def report(s): return first if s == ("first",) else last
 
     ops = [
-        {"gold": "Use the stated relation to put all the steps in one valid order, then take the "
-                 "stated target end.",
-         "neg": "Use the stated relation to put all the steps in one valid order, then take the "
-                "OPPOSITE end from the stated target.",
+        {"gold": "Each rule says one step must come before another. Arrange all of the steps into a "
+                 "single sequence that obeys every rule, and then take the step at the stated target "
+                 "end of that sequence.",
+         "neg": "Each rule says one step must come before another. Arrange all of the steps into a "
+                "single sequence that obeys every rule, and then take the step at the OPPOSITE end "
+                "from the stated target.",
          "apply": order, "neg_apply": order_neg},
-        {"gold": "Report the single step at that end.",
+        {"gold": "Report that single step.",
          "neg": None, "apply": report, "neg_apply": report},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0, 1):
             if which == "neg":
-                return ("Use the stated relation to put all the steps in one valid order, take the "
-                        "OPPOSITE end from the stated target, then report the single step at that end.")
-            return ("Use the stated relation to put all the steps in one valid order, take the "
-                    "stated target end, then report the single step at that end.")
+                return ("Arrange all of the steps into a single sequence that obeys every rule, take "
+                        "the step at the OPPOSITE end from the stated target, and then report that "
+                        "single step.")
+            return ("Arrange all of the steps into a single sequence that obeys every rule, take the "
+                    "step at the stated target end, and then report that single step.")
         raise AssertionError
 
     spec = {"topic": "scheduling", "problem": problem, "ops": ops, "init": None,
@@ -342,21 +387,24 @@ def f_categorize_rule(rng):
     def step_state(s): return classify(flip=(s == ("swapped",)))
 
     ops = [
-        {"gold": "Apply the stated rule's thresholds to the stated value as written.",
-         "neg": "Apply the stated rule's thresholds to the stated value, but swap which threshold "
-                "is which.",
+        {"gold": "The rule in the problem sorts a value into a category using two cut-off points. "
+                 "Compare the value given in the problem against those two cut-off points, in the "
+                 "order the rule writes them.",
+         "neg": "The rule in the problem uses two cut-off points. Compare the value given in the "
+                "problem against them, but SWAP the two cut-off points before you compare.",
          "apply": step_compare, "neg_apply": step_compare_neg},
-        {"gold": "State the category whose range the value falls into.",
+        {"gold": "State the name of the category that the value falls into.",
          "neg": None, "apply": step_state, "neg_apply": step_state},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0, 1):
             if which == "neg":
-                return ("Apply the stated rule's thresholds to the stated value but SWAP which "
-                        "threshold is which, then state the category whose range the value falls into.")
-            return ("Apply the stated rule's thresholds to the stated value as written, then state "
-                    "the category whose range the value falls into.")
+                return ("Compare the value given in the problem against the rule's two cut-off "
+                        "points but with the two points SWAPPED, and then state the name of the "
+                        "category the value falls into.")
+            return ("Compare the value given in the problem against the rule's two cut-off points in "
+                    "the order written, and then state the name of the category it falls into.")
         raise AssertionError
 
     spec = {"topic": "categorize_rule", "problem": problem, "ops": ops, "init": None,
@@ -387,10 +435,12 @@ def f_multi_hop_lookup(rng):
     def report(s): return s
 
     ops = [
-        {"gold": "Resolve the stated start key through the 1st stated mapping.",
+        {"gold": "Take the starting key given in the problem and look it up in the first mapping to "
+                 "find its matching value.",
          "neg": None, "apply": hop1, "neg_apply": hop1},
-        {"gold": "Resolve that result through the 2nd stated mapping.",
-         "neg": "Skip the 2nd stated mapping and keep the result from the 1st mapping unchanged.",
+        {"gold": "Now take that value and look it up in the second mapping to find the next value.",
+         "neg": "Do not use the second mapping at all; simply keep the value you already found from "
+                "the first mapping.",
          "apply": hop2, "neg_apply": hop2_neg},
         {"gold": "Report that final value.",
          "neg": None, "apply": report, "neg_apply": report},
@@ -398,12 +448,14 @@ def f_multi_hop_lookup(rng):
 
     def club2_block(gi, idxs, which):
         if idxs == (0,):
-            return "Resolve the stated start key through the 1st stated mapping."
+            return ("Take the starting key given in the problem and look it up in the first mapping "
+                    "to find its matching value.")
         # (1,2): LOOKUP + REPORT clubbed — two DIFFERENT primitives in one block
         if which == "neg":
-            return ("Skip the 2nd stated mapping and keep the result from the 1st mapping "
-                    "unchanged, then report that final value.")
-        return "Resolve that result through the 2nd stated mapping, then report that final value."
+            return ("Do not use the second mapping at all; simply keep the value you already found "
+                    "from the first mapping, and then report that final value.")
+        return ("Now take that value and look it up in the second mapping to find the next value, "
+                "and then report that final value.")
 
     spec = {"topic": "multi_hop_lookup", "problem": problem, "ops": ops, "init": None,
             "finalize": lambda x: str(x), "club2_groups": [(0,), (1, 2)], "club2_block": club2_block}
@@ -440,23 +492,24 @@ def f_conditional_reco(rng):
     def lookup(s): return grid[(s[0], s[1])]
 
     ops = [
-        {"gold": "Read the 1st stated condition as given.",
-         "neg": "Read the 1st stated condition as the OPPOSITE of what is given.",
+        {"gold": "Read the first condition exactly as the problem states it.",
+         "neg": "Read the first condition as the OPPOSITE of what the problem states.",
          "apply": read1, "neg_apply": read1_neg},
-        {"gold": "Read the 2nd stated condition as given.",
+        {"gold": "Read the second condition exactly as the problem states it.",
          "neg": None, "apply": read2, "neg_apply": read2},
-        {"gold": "Match both stated conditions in the table and report the single item.",
+        {"gold": "Using both conditions together, find the single row of the table they point to, "
+                 "and report the item on that row.",
          "neg": None, "apply": lookup, "neg_apply": lookup},
     ]
 
     def club2_block(gi, idxs, which):
         if idxs == (0,):
             if which == "neg":
-                return "Read the 1st stated condition as the OPPOSITE of what is given."
-            return "Read the 1st stated condition as given."
+                return "Read the first condition as the OPPOSITE of what the problem states."
+            return "Read the first condition exactly as the problem states it."
         # (1,2): BRANCH + MATCH clubbed — two DIFFERENT primitives in one block
-        return ("Read the 2nd stated condition as given, then match both stated conditions in the "
-                "table and report the single item.")
+        return ("Read the second condition exactly as stated, and then using both conditions "
+                "together find the single row of the table they point to and report the item on it.")
 
     spec = {"topic": "conditional_reco", "problem": problem, "ops": ops, "init": None,
             "finalize": lambda x: str(x), "club2_groups": [(0,), (1, 2)], "club2_block": club2_block}
