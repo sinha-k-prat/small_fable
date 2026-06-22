@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""compare_clubbing.py — the COST OF CLUBBING.
+"""compare_clubbing.py — granular club=1 (1 primitive/block) vs club=2 (2 primitives clubbed/block).
 
-Compares grounding_out_c1/results.json (1 op/block) vs grounding_out_c2/results.json (2 clubbed ops/block).
-The honest metric is the CONDITIONAL one: among rows the FROZEN model fails UNAIDED (acc_noplan==0), does it
-(a) FOLLOW a wrong plan to the wrong answer (neg_follow, HIGH=grounding) and (b) avoid ignoring the plan and
-solving anyway (neg_to_gold, LOW=grounding). We print overall + per-topic for c1 and c2 side by side, with
-delta = c2 - c1 (negative neg_follow delta and/or positive neg_to_gold delta = clubbing HURTS grounding).
+Reads grounding_out_c1/results.json and grounding_out_c2/results.json (produced by grounding_test.py)
+and prints, PER CATEGORY and overall, the four probe metrics side by side with the club delta:
 
-FAIRNESS: acc_noplan is a NO-PLAN decode (build_prompt(...turns=None...)) -> plan-independent. c1 and c2 share
-identical problems/topics (clubbing rebundles turns, not the problem text), so the acc_noplan==0 conditional
-subset is the SAME population in both runs. grounding_test.py already restricts its 'conditional' aggregate to
-acc_noplan==0 rows, so we read those numbers directly -> apples-to-apples.
+  acc_plan    gold plan  -> gold answer   (the plan rescues the problem)
+  neg_follow  wrong plan -> wrong answer  HIGH = the model FOLLOWS the plan   <- grounding
+  neg_to_gold wrong plan -> gold answer   LOW  = the model does NOT ignore it <- grounding
+  acc_noplan  no plan    -> gold answer   (how often the plan is even NEEDED)
+
+delta = c2 - c1. A big negative neg_follow delta or big positive neg_to_gold delta = clubbing two
+primitives into one block HURTS following.
+
+FAIRNESS: c1 and c2 are the SAME 100 problems/answers (clubbing only rebundles blocks), and acc_noplan
+is a no-plan decode (plan-independent), so per-category and conditional comparisons are apples-to-apples.
+per_topic is over ALL rows; the OVERALL CONDITIONAL row restricts to rows the model fails unaided
+(acc_noplan==0) — the honest grounding number.
 """
 import json, os, sys
 
@@ -22,54 +27,58 @@ def load(path):
 c1 = load("grounding_out_c1/results.json")
 c2 = load("grounding_out_c2/results.json")
 
-KEYS = ("neg_follow", "neg_to_gold")
+def pct(x):
+    try:    return f"{x:5.0%}"
+    except: return "  n/a"
 
-def row(label, m1, m2):
-    out = [f"  {label:<20}"]
-    for k in KEYS:
-        v1 = m1.get(k, float('nan')); v2 = m2.get(k, float('nan'))
-        d = v2 - v1
-        out.append(f"{k}: c1={v1:6.2%} c2={v2:6.2%} d={d:+6.2%}")
-    n1 = m1.get('n', '?'); n2 = m2.get('n', '?')
-    out.append(f"[n: c1={n1} c2={n2}]")
-    return "  ".join(out)
+def cell(m1, m2, key, delta=True):
+    v1, v2 = m1.get(key), m2.get(key)
+    s = f"{pct(v1)} {pct(v2)}"
+    if delta and v1 is not None and v2 is not None:
+        s += f" {v2 - v1:+5.0%}"
+    elif delta:
+        s += "      "
+    return s
 
-# sanity: marker_rate must be healthy in BOTH, else metrics are unreliable (raise --max_new_tokens & rerun)
-for tag, d in (("c1", c1), ("c2", c2)):
+# ---- marker_rate sanity (truncation guard) ----
+print("="*100)
+for tag, d in (("club1", c1), ("club2", c2)):
     mr = d.get("marker_rate", 0.0)
-    flag = "" if mr >= 0.9 else "  <-- LOW: raise --max_new_tokens and rerun; metrics unreliable"
-    print(f"[{tag}] marker_rate={mr:.0%}  rows={d.get('n_rows','?')}  base={d.get('base','?')}{flag}")
+    flag = "" if mr >= 0.9 else "  <-- LOW: raise --max_new_tokens & rerun; metrics unreliable"
+    print(f"[{tag}] marker_rate={mr:.0%}  rows={d.get('n_rows','?')}  dtype={d.get('dtype','?')}{flag}")
 
-# ---- OVERALL CONDITIONAL (the headline cost of clubbing) ----
-print("\n==== CONDITIONAL (rows the model FAILS unaided; acc_noplan==0) — the honest test ====")
-print("  HIGH neg_follow + LOW neg_to_gold = grounding. delta = c2 - c1 = COST OF CLUBBING.")
-cc1, cc2 = c1.get("conditional", {}), c2.get("conditional", {})
-print(row("OVERALL", cc1, cc2))
-print(f"    (conditional_n: c1={c1.get('conditional_n','?')}  c2={c2.get('conditional_n','?')}; "
-      f"need >=10 for a trustworthy verdict)")
-
-# ---- PER-TOPIC CONDITIONAL ----
-# results.json 'per_topic' is over ALL rows; for an honest per-topic conditional we'd need per-topic acc_noplan==0
-# subsets. The probe only stores conditional in aggregate, so per-topic here is the ALL-ROWS view (still a valid
-# club1-vs-club2 comparison on an identical row population, just not restricted to fails-unaided). We print it as
-# the per-topic delta and ALSO surface acc_noplan per topic so you can see where the plan is actually load-bearing.
-print("\n==== PER-TOPIC (all rows; same 8 topics, same problems across c1/c2) ====")
+# ---- per-category table ----
+hdr = f"{'category':<19}{'n':>3}  | {'neg_follow (HIGH=good)':^20} | {'neg_to_gold (LOW=good)':^20} | {'acc_plan':^12} | {'acc_noplan':^12}"
+print("\nGRANULAR PER-CATEGORY  (each metric: club1  club2  Δ)")
+print(hdr)
+print(f"{'':<22}  | {'c1':>5} {'c2':>5} {'Δ':>5} | {'c1':>5} {'c2':>5} {'Δ':>5} | {'c1':>5} {'c2':>5} | {'c1':>5} {'c2':>5}")
+print("-"*100)
 pt1, pt2 = c1.get("per_topic", {}), c2.get("per_topic", {})
 for t in sorted(set(pt1) | set(pt2)):
     m1, m2 = pt1.get(t, {}), pt2.get(t, {})
-    line = row(t, m1, m2)
-    # annotate how often the plan is needed in this topic (low acc_noplan => clubbing delta is meaningful here)
-    np1 = m1.get('acc_noplan', float('nan')); np2 = m2.get('acc_noplan', float('nan'))
-    print(line + f"  acc_noplan: c1={np1:.0%} c2={np2:.0%}")
+    n = m1.get("n", m2.get("n", "?"))
+    print(f"{t:<19}{n:>3}  | {cell(m1,m2,'neg_follow')} | {cell(m1,m2,'neg_to_gold')} | "
+          f"{cell(m1,m2,'acc_plan',delta=False)} | {cell(m1,m2,'acc_noplan',delta=False)}")
 
-# ---- VERDICTS side by side ----
-print("\n==== VERDICTS ====")
-print(f"  c1 conditional verdict: {c1.get('verdict','?')}   (raw: {c1.get('raw_verdict','?')})")
-print(f"  c2 conditional verdict: {c2.get('verdict','?')}   (raw: {c2.get('raw_verdict','?')})")
-df = cc2.get('neg_follow', float('nan')) - cc1.get('neg_follow', float('nan'))
-dg = cc2.get('neg_to_gold', float('nan')) - cc1.get('neg_to_gold', float('nan'))
-print(f"\n  COST OF CLUBBING (conditional): neg_follow delta={df:+.2%} (want ~0; negative=clubbing hurts following), "
-      f"neg_to_gold delta={dg:+.2%} (want ~0; positive=clubbing makes it ignore the plan).")
-print("  Interpretation: if c2 neg_follow stays >=0.50 and neg_to_gold stays <=0.30, the frozen model handles "
-      "2 clubbed ops per block about as well as 1 -> clubbing is ~free. Large negative neg_follow delta or large "
-      "positive neg_to_gold delta = clubbing degrades grounding (the executor loses the second bundled op).")
+# ---- overall rows ----
+print("-"*100)
+o1, o2 = c1.get("overall", {}), c2.get("overall", {})
+print(f"{'OVERALL (all rows)':<19}{o1.get('n','?'):>3}  | {cell(o1,o2,'neg_follow')} | "
+      f"{cell(o1,o2,'neg_to_gold')} | {cell(o1,o2,'acc_plan',delta=False)} | {cell(o1,o2,'acc_noplan',delta=False)}")
+cc1, cc2 = c1.get("conditional", {}), c2.get("conditional", {})
+cn = c1.get("conditional_n", c2.get("conditional_n", "?"))   # same fails-unaided subset in both
+print(f"{'OVERALL (cond.)':<19}{cn:>3}  | {cell(cc1,cc2,'neg_follow')} | "
+      f"{cell(cc1,cc2,'neg_to_gold')} | {cell(cc1,cc2,'acc_plan',delta=False)} |  fails-unaided")
+print("  ^ CONDITIONAL = only the rows the model fails unaided (acc_noplan==0); this is the honest grounding number.")
+
+# ---- verdict + takeaway ----
+print("="*100)
+print(f"club1 verdict: {c1.get('verdict','?')}    club2 verdict: {c2.get('verdict','?')}")
+df = (cc2.get('neg_follow') or 0) - (cc1.get('neg_follow') or 0)
+dg = (cc2.get('neg_to_gold') or 0) - (cc1.get('neg_to_gold') or 0)
+print(f"\nCOST OF CLUBBING (conditional):  neg_follow Δ={df:+.0%}   neg_to_gold Δ={dg:+.0%}")
+if df > -0.10 and dg < 0.10:
+    print("  -> clubbing 2 primitives per block costs little: the frozen model handles bundled blocks ~as well as single ops.")
+else:
+    print("  -> clubbing HURTS: the model loses the 2nd bundled primitive. Keep primitives one-per-block.")
+print("Read per-category: a category only tells you about grounding where acc_noplan is LOW (the plan is needed).")
