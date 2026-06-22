@@ -27,7 +27,7 @@ lr: 2.0e-5
 lr_min: 8.0e-8
 warmup_frac: 0.05
 lam_resp: 1.0
-lam_kl: 0.5    # raised from 0.1 — old run hit KL=1.82 by epoch 3, destroying instruction-following
+lam_kl: 1.5    # raised from 0.1 — old run hit KL=1.82 by epoch 3, destroying instruction-following
 max_resp: 256
 plan_max_len: 24
 out: joint_ckpt
