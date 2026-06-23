@@ -24,3 +24,4 @@ rl_rollouts.jsonl
 *.log
 wandb/
 plan_vocab.json
+out_*

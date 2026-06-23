@@ -290,11 +290,13 @@ def plot_results(metrics, per_topic, per_turns, out_png):
 # DRIVER
 # ===========================================================================================
 def _agg():
-    return {"acc_plan": 0.0, "neg_follow": 0.0, "neg_to_gold": 0.0, "acc_noplan": 0.0, "n": 0}
+    return {"acc_plan": 0.0, "neg_follow": 0.0, "neg_to_gold": 0.0, "neg_other": 0.0,
+            "acc_noplan": 0.0, "n": 0}
 
 def _finalize(d):
     n = max(1, d["n"])
-    return {k: d[k] / n for k in ("acc_plan", "neg_follow", "neg_to_gold", "acc_noplan")} | {"n": d["n"]}
+    return {k: d[k] / n for k in ("acc_plan", "neg_follow", "neg_to_gold", "neg_other",
+                                  "acc_noplan")} | {"n": d["n"]}
 
 def main():
     ap = argparse.ArgumentParser(description="Frozen-model English-plan grounding probe (inference only).")
@@ -350,6 +352,7 @@ def main():
     per_turns = collections.defaultdict(_agg)
     cond = _agg()                           # CONDITIONAL: only rows the model FAILS unaided (acc_noplan==0)
     examples = []
+    records = []                            # per-row dump for cross-format analysis (analyze_formats.py)
     marker_hits = marker_total = 0          # fraction of decodes that reached FINAL ANSWER: (truncation check)
 
     for i, r in enumerate(rows):
@@ -372,8 +375,13 @@ def main():
             d_neg = decode(build_prompt(tok, setup, nturns, cue, has_ct))
             neg_follow  = grade(d_neg, neg,  r, want="neg")
             neg_to_gold = grade(d_neg, gold, r, want="gold")
+            # 3rd wrong-plan outcome: the neg-plan decode committed an answer that matched NEITHER
+            # the neg answer (followed) NOR gold (ignored/overrode) -> botched execution. Requires a
+            # committed FINAL ANSWER: marker (an uncommitted/truncated decode is not 'other').
+            neg_other = 1.0 if (_FINAL_RE.search(d_neg) and neg_follow == 0.0
+                                and neg_to_gold == 0.0) else 0.0
         else:
-            d_neg, neg_follow, neg_to_gold = "", 0.0, 0.0
+            d_neg, neg_follow, neg_to_gold, neg_other = "", 0.0, 0.0, 0.0
 
         for dtxt in (d_plan, d_noplan, d_neg):     # marker_rate: did the decode actually commit?
             if dtxt != "":
@@ -387,8 +395,16 @@ def main():
             agg["acc_plan"]    += acc_plan
             agg["neg_follow"]  += neg_follow
             agg["neg_to_gold"] += neg_to_gold
+            agg["neg_other"]   += neg_other
             agg["acc_noplan"]  += acc_noplan
             agg["n"] += 1
+
+        # per-row record (lean; one per row) — lets analyze_formats.py restrict to fails-unaided
+        # (acc_noplan==0) per task and read the 3-way wrong-plan split, identically across formats.
+        records.append({"id": r.get("id", i), "topic": topic, "n_turns": n_turns,
+                        "acc_noplan": acc_noplan, "acc_plan": acc_plan,
+                        "neg_follow": neg_follow, "neg_to_gold": neg_to_gold,
+                        "neg_other": neg_other})
 
         if len(examples) < 12:
             examples.append({"id": r.get("id", i), "topic": topic, "n_turns": n_turns,
@@ -396,7 +412,8 @@ def main():
                              "plan_decode": d_plan[-120:], "neg_decode": d_neg[-120:],
                              "noplan_decode": d_noplan[-120:],
                              "acc_plan": acc_plan, "neg_follow": neg_follow,
-                             "neg_to_gold": neg_to_gold, "acc_noplan": acc_noplan})
+                             "neg_to_gold": neg_to_gold, "neg_other": neg_other,
+                             "acc_noplan": acc_noplan})
 
         if (i + 1) % 10 == 0 or (i + 1) == len(rows):
             m = _finalize(overall)
@@ -427,6 +444,7 @@ def main():
         "verdict": verdict, "raw_verdict": raw_verdict,
         "verdict_rule": "CONDITIONAL: among rows the model fails unaided, grounding iff "
                         "neg_follow>=0.50 AND neg_to_gold<=0.30 (n>=10)",
+        "records": records,
         "examples": examples,
     }
     res_path = os.path.join(args.out, "results.json")
