@@ -230,8 +230,9 @@ def main():
         total_correct += score
         total_n += 1
 
+        model_answer = " ".join(_answer_span(decoded).split())[:60] if committed else "(no FINAL ANSWER)"
         records.append({"id": r.get("id", i), "category": cat, "correct": score,
-                        "committed": committed, "gold": r["answer"]})
+                        "committed": committed, "gold": r["answer"], "model_answer": model_answer})
         if len(examples) < 20:
             examples.append({"id": r.get("id", i), "category": cat, "gold": r["answer"],
                              "why_hard": r.get("why_hard", ""),
