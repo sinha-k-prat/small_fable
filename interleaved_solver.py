@@ -67,12 +67,21 @@ from hard_bench_run import grade, _FINAL_RE, _answer_span
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from tools import interleaved_blocks as IB
 from tools.interleaved_blocks import CATEGORY_SKILL, SKILLS, generic_violations
+# FROZEN design-time leak audit -> green pool. The hunt SEEDS only from judge-approved (non-leaking)
+# variants; a 'leak' variant (e.g. decompose_and_recombine v0's "Multiply ... Add") is dropped whenever
+# a generic sibling exists. No judge runs here at hunt time — green_variants() reads frozen verdicts.
+from tools.leak_audit import green_variants
 
 
 def variants_for_category(category):
     """Ordered list of GENERIC block-variants (each a list of plain block strings) for a category's
-    skill — the starting search space the per-category mutation loop explores."""
-    return [list(v) for v in SKILLS[CATEGORY_SKILL[category]]["variants"]]
+    skill — the starting search space the per-category mutation loop explores. FILTERED to the frozen
+    green pool (tools.leak_audit): leaking variants are excluded when a generic sibling covers the skill,
+    so the hunt never seeds from a task-lifted block."""
+    skill = CATEGORY_SKILL[category]
+    all_variants = SKILLS[skill]["variants"]
+    keep = green_variants(skill)
+    return [list(all_variants[i]) for i in keep]
 
 
 def skill_for_category(category):
