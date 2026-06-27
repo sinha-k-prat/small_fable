@@ -79,15 +79,23 @@ def load_model(tag, device="cpu", dtype=torch.float32):
     """Load a frozen Qwen2.5 bundle from the local HF cache (no download)."""
     os.environ.setdefault("HF_HUB_OFFLINE", "1")  # defensive: no network
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    import inspect
+
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     name = MODEL_IDS[tag]
     tok = AutoTokenizer.from_pretrained(name, local_files_only=True)
+    # dtype kwarg name is version-dependent: 4.44 only accepts `torch_dtype=`;
+    # modern transformers (~4.56+) renames it to `dtype=` and deprecates `torch_dtype`.
+    # Introspect the installed from_pretrained signature and pass whichever it accepts.
+    # NOT "auto" (would give bf16 on some caches) — we force fp32 for exact reconstruction.
+    _params = inspect.signature(AutoModelForCausalLM.from_pretrained).parameters
+    _dtype_kw = "dtype" if "dtype" in _params else "torch_dtype"
     model = AutoModelForCausalLM.from_pretrained(
         name,
-        torch_dtype=dtype,  # NOT "auto" (would give bf16 on some caches); transformers 4.44 uses torch_dtype=
         local_files_only=True,
         attn_implementation="eager",  # exact attn-write reconstruction on CPU
+        **{_dtype_kw: dtype},
     ).to(device)
     model.eval()
     model.requires_grad_(False)
@@ -112,8 +120,16 @@ def load_model(tag, device="cpu", dtype=torch.float32):
     assert dp.bias is None, "down_proj must have no bias"
     assert bundle.gate_proj(0).weight.shape == (bundle.intermediate, bundle.hidden)
     assert bundle.up_proj(0).weight.shape == (bundle.intermediate, bundle.hidden)
-    # tied unembedding shares storage with embed_tokens
-    assert (
-        bundle.model.lm_head.weight.data_ptr() == bundle.embed().weight.data_ptr()
-    ), "lm_head should be tied to embed_tokens"
+    # tied unembedding shares storage with embed_tokens.
+    # `cfg.tie_word_embeddings` (asserted above) already guarantees tying semantically.
+    # The stricter data_ptr() identity check is fragile on modern transformers: with
+    # tied weights `lm_head` may be re-tied lazily, materialized separately (meta/device_map
+    # paths), or absent entirely (get_output_embeddings() returns None) -> spurious
+    # AssertionError/AttributeError. So go through the accessor and only assert when a
+    # distinct output-embedding weight is materialized; still catches real un-tying on 4.44.
+    out_emb = bundle.model.get_output_embeddings()
+    if out_emb is not None and getattr(out_emb, "weight", None) is not None:
+        assert (
+            out_emb.weight.data_ptr() == bundle.embed().weight.data_ptr()
+        ), "lm_head should be tied to embed_tokens"
     return bundle
