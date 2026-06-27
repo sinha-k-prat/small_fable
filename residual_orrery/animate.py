@@ -23,11 +23,33 @@ import numpy as np
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.cm as cm  # cm.get_cmap (mpl-3.2 safe)  # noqa: E402
+import matplotlib.cm as cm  # noqa: E402  (fallback path only)
 import matplotlib.pyplot as plt  # noqa: E402
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401,E402  (registers '3d')
 
 import imageio  # noqa: E402
+
+
+def _get_cmap(name):
+    """Version-safe colormap accessor. matplotlib>=3.6 exposes mpl.colormaps[name];
+    cm.get_cmap was REMOVED in 3.9. Old local mpl 3.2 has neither colormaps[] nor a
+    removal, so it falls through to cm.get_cmap. Works on 3.2 AND modern Colab 3.10."""
+    try:
+        return matplotlib.colormaps[name]  # mpl >= 3.6
+    except (AttributeError, KeyError):
+        return cm.get_cmap(name)  # mpl < 3.6
+
+
+def _save_gif(out, frames, fps):
+    """Version-safe GIF write. imageio v2 takes duration as seconds/frame; v3 changed
+    the kwargs, so fall back progressively to the most basic mimsave call."""
+    try:
+        imageio.mimsave(out, frames, duration=1.0 / fps, loop=0)
+    except TypeError:
+        try:
+            imageio.mimsave(out, frames, duration=1.0 / fps)
+        except TypeError:
+            imageio.mimsave(out, frames)
 
 
 # ----------------------------------------------------------------------------
@@ -279,7 +301,7 @@ def _draw_active_glow(ax, proj, fstate, style):
     nrm = np.asarray(fstate.glow_norm)  # [K]
     env = fstate.glow_env
     sizes = (style.s_min + (style.s_max - style.s_min) * nrm) * (0.4 + 0.6 * env)
-    cmap = cm.get_cmap(style.cmap_name)
+    cmap = _get_cmap(style.cmap_name)
     rgba = cmap(nrm)  # [K, 4]
     rgba[:, 3] = (0.35 + 0.65 * nrm) * (0.3 + 0.7 * env)  # alpha 0.35->1.0, pulsed
     ax.scatter(
@@ -350,8 +372,14 @@ def _blacken_3d_axes(ax, style):
     + wireframe. Paint panes black and kill the grid/tick lines so the sphere shows."""
     ax.set_facecolor(style.bg)
     transparent = (0.0, 0.0, 0.0, 0.0)
-    for axis in (ax.w_xaxis, ax.w_yaxis, ax.w_zaxis):
-        axis.set_pane_color((0.0, 0.0, 0.0, 1.0))  # solid black pane
+    # w_xaxis/w_yaxis/w_zaxis were REMOVED in mpl 3.8; modern uses xaxis/yaxis/zaxis.
+    axes3 = (ax.w_xaxis, ax.w_yaxis, ax.w_zaxis) if hasattr(ax, "w_xaxis") \
+        else (ax.xaxis, ax.yaxis, ax.zaxis)
+    for axis in axes3:
+        try:
+            axis.set_pane_color((0.0, 0.0, 0.0, 1.0))  # solid black pane
+        except Exception:
+            axis.pane.set_facecolor((0.0, 0.0, 0.0, 1.0)); axis.pane.set_alpha(1.0)
         axis.line.set_color(transparent)
         axis._axinfo["grid"]["color"] = transparent
         axis._axinfo["grid"]["linewidth"] = 0.0
@@ -438,7 +466,7 @@ def render_compare_gif(
         if keep_frames:
             _dump_png(frame_dir, i, buf)
     plt.close(fig)
-    imageio.mimsave(out, frames, duration=1.0 / fps, loop=0)
+    _save_gif(out, frames, fps)
     return out
 
 
@@ -477,5 +505,5 @@ def render_single_gif(
         if keep_frames:
             _dump_png(frame_dir, i, buf)
     plt.close(fig)
-    imageio.mimsave(out, frames, duration=1.0 / fps, loop=0)
+    _save_gif(out, frames, fps)
     return out

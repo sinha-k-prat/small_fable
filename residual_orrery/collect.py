@@ -20,7 +20,10 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
-import torch
+
+# torch is imported LAZILY inside the collection functions only. The dataclasses
+# (RunCollection/TrajNode/NodeKind), project.py, animate.py and the --smoke path are
+# torch-free, so they import + run on a machine without torch (e.g. a render-only env).
 
 from .examples import EXAMPLES, build_input_ids
 
@@ -74,6 +77,7 @@ def node_count(n_layers):
 
 def _np(t):
     """detach -> float32 -> cpu -> numpy, 1-D copy."""
+    import torch
     return t.detach().to(torch.float32).cpu().numpy().copy()
 
 
@@ -82,6 +86,7 @@ def collect_run(bundle, instruction, topk=48, self_test=True):
 
     Returns a RunCollection. All capture happens at column ``pos`` (last prompt token).
     """
+    import torch
     ids = build_input_ids(bundle, instruction)  # [1, T]
     T = ids.shape[1]
     pos = T - 1
@@ -231,6 +236,7 @@ def collect_run(bundle, instruction, topk=48, self_test=True):
 
 def _self_test(bundle, rc, out, store):
     """Mechanistic asserts (§9). Cheap: a handful of vector norms."""
+    import torch
     N, H, I = rc.N, rc.H, rc.I
     pos = rc.last_pos
     tol = 1e-3  # fp32 CPU; spec uses 1e-4, loosen slightly for safety
