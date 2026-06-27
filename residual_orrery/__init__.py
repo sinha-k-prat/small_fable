@@ -13,11 +13,23 @@ Module dependency graph (enforced):
 imageio only) so they iterate fast on cached .npz without loading a model.
 """
 
-from .examples import EXAMPLES, build_input_ids
+from .examples import (
+    EXAMPLES,
+    build_input_ids,
+    Task,
+    VARIANTS,
+    EXAMPLES_PLAIN,
+    EXAMPLES_SIMPLE,
+    EXAMPLES_DETAILED,
+    TASK_KEYS,
+)
 from .project import fit_sphere_frame, project_run, SphereFrame, ProjectedRun
 from .animate import (
     render_compare_gif,
     render_single_gif,
+    render_collective_gif,
+    render_collective_pair_gif,
+    render_rescue_gif,
     GlowStyle,
     STYLE,
     slerp,
@@ -37,7 +49,17 @@ try:  # pragma: no cover - exercised when torch present
         NodeKind,
         TrajNode,
     )
-    from .compare import build_compare, run_compare, CompareResult
+    from .compare import (
+        build_compare,
+        run_compare,
+        CompareResult,
+        build_collective,
+        run_collective,
+        CollectiveResult,
+        build_rescue,
+        run_rescue,
+        RescueResult,
+    )
 
     _TORCH_OK = True
 except Exception as _exc:  # pragma: no cover
@@ -49,12 +71,21 @@ __version__ = "0.1.0"
 __all__ = [
     "EXAMPLES",
     "build_input_ids",
+    "Task",
+    "VARIANTS",
+    "EXAMPLES_PLAIN",
+    "EXAMPLES_SIMPLE",
+    "EXAMPLES_DETAILED",
+    "TASK_KEYS",
     "fit_sphere_frame",
     "project_run",
     "SphereFrame",
     "ProjectedRun",
     "render_compare_gif",
     "render_single_gif",
+    "render_collective_gif",
+    "render_collective_pair_gif",
+    "render_rescue_gif",
     "GlowStyle",
     "STYLE",
     "slerp",
@@ -76,4 +107,10 @@ if _TORCH_OK:
         "build_compare",
         "run_compare",
         "CompareResult",
+        "build_collective",
+        "run_collective",
+        "CollectiveResult",
+        "build_rescue",
+        "run_rescue",
+        "RescueResult",
     ]

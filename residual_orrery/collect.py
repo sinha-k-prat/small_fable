@@ -22,6 +22,7 @@ Verified shapes / facts (transformers 4.44.2 AND modern ~4.55, eager attn, fp32,
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -67,6 +68,11 @@ class RunCollection:
     N: int
     I: int
     topk: int
+    # ---- v2 additive: full generated answer + correctness for the terminal beacon ----
+    answer_text: str = ""        # full greedy continuation (decoded, specials skipped)
+    gold: str = ""               # gold string this run was judged against ("" if unknown)
+    grade_mode: str = ""         # "digits"|"substr"|"equal"|"" (correctness normalizer)
+    is_correct: object = None    # True / False / None(unknown) — bool or None
 
 
 # ----------------------------------------------------------------------------
@@ -95,13 +101,84 @@ def _first_tensor(x):
     return x[0] if isinstance(x, tuple) else x
 
 
-def collect_run(bundle, instruction, topk=48, self_test=True):
+# ----------------------------------------------------------------------------
+# v2: greedy multi-token answer + normalized correctness (additive, opt-in)
+# ----------------------------------------------------------------------------
+def _greedy_answer(bundle, ids, max_new_tokens):
+    """Greedy multi-token continuation of `ids` ([1,T] on bundle.device) -> decoded NEW
+    tokens only, specials skipped, stripped. torch.no_grad, device-safe. Returns '' if
+    max_new_tokens<=0. Version-safe: CLEAN GenerationConfig (the cached Qwen config sets
+    temperature/top_p/top_k, which WARN under do_sample=False) + explicit attention_mask;
+    ChatML stop via eos_token_id=[<|im_end|>, eos]."""
+    import torch
+    from transformers import GenerationConfig
+    if max_new_tokens is None or max_new_tokens <= 0:
+        return ""
+    tok = bundle.tokenizer
+    T = ids.shape[1]
+    attn = torch.ones_like(ids)
+    eos = tok.eos_token_id
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    eos_ids = [e for e in (im_end, eos) if isinstance(e, int) and e >= 0] or eos
+    gc = GenerationConfig(
+        do_sample=False, num_beams=1,
+        max_new_tokens=int(max_new_tokens),
+        pad_token_id=(eos if eos is not None else tok.pad_token_id),
+        eos_token_id=eos_ids,                 # list -> stop on <|im_end|> OR eos
+        temperature=None, top_p=None, top_k=None,
+    )
+    with torch.no_grad():
+        out = bundle.model.generate(ids, attention_mask=attn, generation_config=gc)
+    new_ids = out[0, T:].detach().to("cpu").tolist()
+    return tok.decode(new_ids, skip_special_tokens=True).strip()
+
+
+def _norm_alnum(s):
+    """lowercase, keep [a-z0-9] only (drops spaces/punct)."""
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+def _digits_only_last(s):
+    """LAST contiguous integer run in the string, digits only. Handles
+    'FINAL ANSWER: 8,293,662.' and the scaffold's many earlier numbers by taking the LAST
+    run -> the committed answer. '' if no digits."""
+    runs = re.findall(r"\d[\d,]*", str(s))
+    return re.sub(r"\D", "", runs[-1]) if runs else ""
+
+
+def judge(answer_text, gold, mode):
+    """-> True / False / None(unknown). None when gen skipped or gold/mode missing."""
+    if not gold or not mode or answer_text is None or answer_text == "":
+        return None
+    if mode == "digits":
+        a, g = _digits_only_last(answer_text), _digits_only_last(gold)
+        return None if (a == "" or g == "") else (a == g)   # EXACT last-run equality
+    if mode == "equal":
+        return _norm_alnum(answer_text) == _norm_alnum(gold)
+    # default "substr": gold appears as a normalized substring of the answer
+    g = _norm_alnum(gold)
+    return (g != "") and (g in _norm_alnum(answer_text))
+
+
+def collect_run(bundle, instruction, topk=48, self_test=True,
+                generate=False, gen_tokens=24, gold="", grade_mode=""):
     """Run one forward pass, capture the trajectory for the last prompt token.
 
     Returns a RunCollection. All capture happens at column ``pos`` (last prompt token).
+
+    ``instruction`` may be a str OR a ``Task``. If a Task: system/gold/grade/gen_tokens come
+    from it (and override the kwargs). ``generate=False`` (default) => identical to v1 (no
+    ``.generate`` call). The traced through-layer trajectory is byte-for-byte unchanged;
+    generation is a separate post-hoc call that only sets answer_text/correctness.
     """
     import torch
-    ids = build_input_ids(bundle, instruction)  # [1, T]
+    from .examples import Task
+    if isinstance(instruction, Task):
+        gold = instruction.gold
+        grade_mode = instruction.grade
+        if generate:
+            gen_tokens = instruction.gen_tokens
+    ids = build_input_ids(bundle, instruction)  # [1, T]; accepts str OR Task
     T = ids.shape[1]
     pos = T - 1
     N = bundle.n_layers
@@ -227,9 +304,12 @@ def collect_run(bundle, instruction, topk=48, self_test=True):
         assert cols.shape == (K, H), cols.shape
         down_cols[L] = cols
 
+    # Store a JSON-serializable instruction string (Task -> its user prompt) so the cache
+    # sidecar stays plain-JSON; the trajectory/answer are what matter downstream.
+    instr_str = instruction.user if isinstance(instruction, Task) else instruction
     rc = RunCollection(
         tag=bundle.tag,
-        instruction=instruction,
+        instruction=instr_str,
         input_ids=ids[0].detach().cpu().numpy().astype(np.int64),
         last_pos=pos,
         pred_token_id=pred_id,
@@ -247,6 +327,16 @@ def collect_run(bundle, instruction, topk=48, self_test=True):
 
     if self_test:
         _self_test(bundle, rc, out, store)
+
+    # ---- v2: greedy answer + correctness (only when requested) ----
+    # Reuse the SAME ids (the traced forward's hooks were removed in `finally`), so the
+    # system message threads through identically. The pred_token_id / unembed_dir / nodes
+    # path above is byte-for-byte unchanged.
+    if generate and gen_tokens and gen_tokens > 0:
+        rc.answer_text = _greedy_answer(bundle, ids, gen_tokens)
+        rc.gold = gold or ""
+        rc.grade_mode = grade_mode or ""
+        rc.is_correct = judge(rc.answer_text, rc.gold, rc.grade_mode)
     return rc
 
 
@@ -298,23 +388,39 @@ def _self_test(bundle, rc, out, store):
     assert len(rc.nodes) == node_count(N)
 
 
-def collect_all(bundle, instructions=EXAMPLES, topk=48, self_test=True):
-    """Collect a RunCollection for each instruction (in order)."""
-    return [collect_run(bundle, ins, topk=topk, self_test=self_test) for ins in instructions]
+def collect_all(bundle, instructions=EXAMPLES, topk=48, self_test=True,
+                generate=False, gen_tokens=24):
+    """Collect a RunCollection for each instruction (in order). ``generate=False`` => legacy.
+    When instructions are Tasks, per-task gold/grade/gen_tokens are pulled inside collect_run;
+    a scalar ``gen_tokens`` is the fallback cap for non-Task / plain instructions."""
+    return [collect_run(bundle, ins, topk=topk, self_test=self_test,
+                        generate=generate, gen_tokens=gen_tokens) for ins in instructions]
 
 
 # ----------------------------------------------------------------------------
 # Disk cache: flat .npz arrays + .json sidecar (no pickle of custom classes).
 # ----------------------------------------------------------------------------
-def _cache_key(bundle, instructions, topk):
+def _instr_repr(ins):
+    """Stable repr for an instruction in the cache key. A Task contributes its
+    system+user+gold+grade+gen so SIMPLE vs DETAILED never alias."""
+    from .examples import Task
+    if isinstance(ins, Task):
+        return repr((ins.key, ins.system, ins.user, ins.gold, ins.grade, ins.gen_tokens))
+    return repr(ins)
+
+
+def _cache_key(bundle, instructions, topk, generate=False, gen_tokens=24):
     import transformers
 
     payload = "|".join(
         [
+            "v2",
             bundle.tag,
             transformers.__version__,
             str(int(topk)),
-            repr(tuple(instructions)),
+            str(bool(generate)),
+            str(int(gen_tokens)),
+            repr(tuple(_instr_repr(i) for i in instructions)),
             str(getattr(bundle.tokenizer, "name_or_path", "")),
         ]
     )
@@ -349,6 +455,10 @@ def _save_runs(runs, npz_path, json_path):
                 "N": rc.N,
                 "I": rc.I,
                 "topk": rc.topk,
+                "answer_text": rc.answer_text,
+                "gold": rc.gold,
+                "grade_mode": rc.grade_mode,
+                "is_correct": (None if rc.is_correct is None else bool(rc.is_correct)),
             }
         )
     os.makedirs(os.path.dirname(npz_path), exist_ok=True)
@@ -391,16 +501,23 @@ def _load_runs(npz_path, json_path):
                 N=rm["N"],
                 I=rm["I"],
                 topk=rm["topk"],
+                answer_text=rm.get("answer_text", ""),
+                gold=rm.get("gold", ""),
+                grade_mode=rm.get("grade_mode", ""),
+                is_correct=rm.get("is_correct", None),
             )
         )
     return runs
 
 
 def collect_all_cached(
-    bundle, instructions=EXAMPLES, topk=48, cache_dir="out/cache", use_cache=True
+    bundle, instructions=EXAMPLES, topk=48, cache_dir="out/cache", use_cache=True,
+    generate=False, gen_tokens=24,
 ):
-    """Cached variant of collect_all. Miss -> collect_all -> save; hit -> load .npz/.json."""
-    key = _cache_key(bundle, instructions, topk)
+    """Cached variant of collect_all. Miss -> collect_all -> save; hit -> load .npz/.json.
+    ``generate``/``gen_tokens`` thread through into the cache key (so a generated run never
+    aliases a v1 cache, and SIMPLE vs DETAILED vs different caps get distinct files)."""
+    key = _cache_key(bundle, instructions, topk, generate=generate, gen_tokens=gen_tokens)
     npz_path = os.path.join(cache_dir, key + ".npz")
     json_path = os.path.join(cache_dir, key + ".json")
     if use_cache and os.path.exists(npz_path) and os.path.exists(json_path):
@@ -408,6 +525,7 @@ def collect_all_cached(
             return _load_runs(npz_path, json_path)
         except Exception:
             pass  # fall through to recompute on any corruption
-    runs = collect_all(bundle, instructions, topk=topk)
+    runs = collect_all(bundle, instructions, topk=topk,
+                       generate=generate, gen_tokens=gen_tokens)
     _save_runs(runs, npz_path, json_path)
     return runs

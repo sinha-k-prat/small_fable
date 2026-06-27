@@ -78,6 +78,19 @@ class GlowStyle:
     azim0: float = -60.0
     wire_stride: int = 16
     zoom: float = 1.5                                    # blow the unit sphere up in-panel
+    # ---- v2: correctness beacon (Feature 2) ----
+    beacon_correct_rgb: tuple = (0.20, 0.95, 0.45)       # green
+    beacon_wrong_rgb: tuple = (0.95, 0.28, 0.28)         # red
+    beacon_unknown_rgb: tuple = (1.0, 0.78, 0.18)        # amber/gold (unknown)
+    beacon_s: float = 90.0
+    beacon_label_fs: float = 11.0
+    # ---- v2: input token marker (Feature 2) ----
+    input_rgba: tuple = (0.35, 1.0, 0.55, 1.0)           # green diamond at node 0
+    input_s: float = 70.0
+    # ---- v2: MLP -> writer-column links (Feature 6) ----
+    link_rgba: tuple = (0.70, 0.80, 1.0, 0.16)           # faint cool
+    link_lw: float = 0.6
+    link_topn: int = 4                                   # 3..5 brightest firing cols
 
 
 STYLE = GlowStyle()
@@ -365,29 +378,69 @@ def _draw_active_glow(ax, proj, fstate, style):
     )
 
 
-def _draw_unembed(ax, proj, fstate, style):
+def _beacon_rgb(proj, style):
+    c = getattr(proj, "is_correct", None)
+    if c is True:
+        return style.beacon_correct_rgb
+    if c is False:
+        return style.beacon_wrong_rgb
+    return style.beacon_unknown_rgb                  # None -> amber
+
+
+def _draw_beacon(ax, proj, fstate, style, label_prefix=""):
+    """Terminal beacon at unembed_sphere: persistent, pulsing, GREEN/RED/amber by correctness,
+    labeled with the generated answer (falls back to pred_token_str for old/smoke runs).
+    Replaces _draw_unembed; keeps its pulse/halo/hold mechanics. Beacon color is decoupled
+    from pred_token_id — it comes ONLY from is_correct."""
     t = proj.unembed_sphere  # [3]
-    g = fstate.target_glow
-    base_alpha = 0.35 + 0.65 * g
-    rgba = list(style.target_rgba[:3]) + [base_alpha]
-    size = 60 + 140 * g
-    ax.scatter(
-        [t[0]], [t[1]], [t[2]], s=size, c=[rgba], depthshade=False, edgecolors="none"
-    )
-    if g > 0:  # expanding halo + label during the final hold
-        halo = list(style.target_rgba[:3]) + [0.18 * g]
-        ax.scatter(
-            [t[0]],
-            [t[1]],
-            [t[2]],
-            s=size * (2.0 + 2.0 * g),
-            c=[halo],
-            depthshade=False,
-            edgecolors="none",
-        )
-        ax.text(
-            t[0], t[1], t[2], "  %s" % proj.pred_token_str, color="gold", fontsize=10
-        )
+    rgb = _beacon_rgb(proj, style)
+    g = fstate.target_glow                            # 0 until end-hold, ramps to 1
+    pulse = 0.55 + 0.45 * fstate.glow_env             # reuse glow_env (no new FrameState field)
+    base_a = 0.45 + 0.55 * g
+    ax.scatter([t[0]], [t[1]], [t[2]], s=style.beacon_s * (1.0 + 1.2 * g),
+               c=[list(rgb) + [base_a]], depthshade=False, edgecolors="none")
+    ax.scatter([t[0]], [t[1]], [t[2]], s=style.beacon_s * (2.2 + 2.5 * g) * pulse,    # halo
+               c=[list(rgb) + [0.16 * (0.5 + g)]], depthshade=False, edgecolors="none")
+    label = (getattr(proj, "answer_text", "") or proj.pred_token_str).strip().replace("\n", " ")
+    if len(label) > 22:
+        label = label[:21] + "…"
+    if g > 0:
+        ax.text(t[0], t[1], t[2], "  " + label_prefix + label, color="white",
+                fontsize=style.beacon_label_fs,
+                bbox=dict(facecolor=list(rgb) + [0.35], edgecolor="none", pad=1.5))
+
+
+def _draw_input_marker(ax, proj, style):
+    """Distinct diamond at node 0 (the INPUT/embed token) so the trajectory start is
+    identifiable. marker='D', depthshade=False, edgecolors='none' — verified on mpl 3.2.2."""
+    p = proj.traj_sphere[0]
+    ax.scatter([p[0]], [p[1]], [p[2]], s=style.input_s, marker="D",
+               c=[style.input_rgba], depthshade=False, edgecolors="none")
+
+
+def _draw_mlp_links(ax, proj, fstate, style):
+    """Faint dashed links from the active MLP residual node to its top-N firing writer-column
+    stars. Drawn only while an MLP layer fires, so links appear and fade with the marker.
+    stars_sphere[L] is already desc-sorted by |a| in collect_run."""
+    if fstate.active_kind != "mlp":
+        return
+    L = fstate.active_layer
+    if L not in proj.stars_sphere or L not in proj.stars_a:
+        return
+    src = proj.traj_sphere[2 * L + 2]                 # MLP node index in the P=2N+3 layout
+    stars = proj.stars_sphere[L]                      # [K,3]
+    a = np.asarray(proj.stars_a[L], np.float64)       # [K] desc by |a|
+    if stars.shape[0] == 0:
+        return
+    n = min(style.link_topn, stars.shape[0])
+    env = fstate.glow_env
+    for k in range(n):
+        d = stars[k]
+        w = a[k] / max(a[0], 1e-8)
+        alpha = float(np.clip(style.link_rgba[3] * w * (0.4 + 0.6 * env), 0.0, 1.0))
+        ax.plot([src[0], d[0]], [src[1], d[1]], [src[2], d[2]],
+                color=style.link_rgba[:3], alpha=alpha, linewidth=style.link_lw,
+                linestyle=":", solid_capstyle="round")
 
 
 def _draw_trace(ax, proj, fstate, style):
@@ -438,14 +491,17 @@ def _blacken_3d_axes(ax, style):
         axis._axinfo["grid"]["linewidth"] = 0.0
 
 
-def render_panel(ax, proj, fstate, style):
+def render_panel(ax, proj, fstate, style, links=True, beacon_prefix=""):
     ax.cla()
     _blacken_3d_axes(ax, style)
     _draw_wire_sphere(ax, style)
     _draw_static_stars(ax, proj, style)
+    if links:
+        _draw_mlp_links(ax, proj, fstate, style)      # Feature 6 (faint, under glow)
     _draw_active_glow(ax, proj, fstate, style)
-    _draw_unembed(ax, proj, fstate, style)
+    _draw_beacon(ax, proj, fstate, style, label_prefix=beacon_prefix)   # Feature 2 (was _draw_unembed)
     _draw_trace(ax, proj, fstate, style)
+    _draw_input_marker(ax, proj, style)               # Feature 2 (on top)
     # equal cube via equal limits (mpl 3.2 has NO set_box_aspect; set_aspect('equal') raises)
     ax.set_xlim(-1.0, 1.0)
     ax.set_ylim(-1.0, 1.0)
@@ -515,6 +571,244 @@ def render_compare_gif(
             color="w",
             fontsize=12,
         )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, facecolor=style.bg)
+        buf.seek(0)
+        frames.append(imageio.imread(buf.getvalue()))
+        if keep_frames:
+            _dump_png(frame_dir, i, buf)
+    plt.close(fig)
+    _save_gif(out, frames, fps)
+    return out
+
+
+# ----------------------------------------------------------------------------
+# v2: collective (Feature 4) + rescue (Feature 5) — multiple traces on ONE sphere
+# ----------------------------------------------------------------------------
+import dataclasses  # noqa: E402  (used by the overlay style-clone)
+
+
+def _trace_style(style, rgb):
+    """Clone `style` so _draw_trace / _draw_input_marker pick up a per-trace color while the
+    BEACON stays correctness-colored (we don't touch the beacon_* fields)."""
+    rgb3 = tuple(rgb[:3])
+    return dataclasses.replace(
+        style,
+        trace_rgba=rgb3 + (0.95,),
+        node_hot_rgba=rgb3 + (1.0,),
+        node_dim_rgba=rgb3 + (0.45,),
+        input_rgba=rgb3 + (1.0,),
+    )
+
+
+def _draw_overlay_frame(ax, projs, states, styles, i, links, prefixes):
+    """Draw one frame of N overlaid traces into the SAME 3D axis. Wire sphere + static-star
+    union drawn ONCE, then each trace's glow/beacon/trace/input/links layered in."""
+    ax.cla()
+    _blacken_3d_axes(ax, styles[0])
+    _draw_wire_sphere(ax, styles[0])
+    for proj, st in zip(projs, states):
+        _draw_static_stars(ax, proj, styles[0])
+    for j, (proj, st, stl) in enumerate(zip(projs, states, styles)):
+        fs = st[i]
+        if links:
+            _draw_mlp_links(ax, proj, fs, stl)
+        _draw_active_glow(ax, proj, fs, stl)
+        _draw_beacon(ax, proj, fs, stl, label_prefix=prefixes[j])
+        _draw_trace(ax, proj, fs, stl)
+        _draw_input_marker(ax, proj, stl)
+    ax.set_xlim(-1.0, 1.0)
+    ax.set_ylim(-1.0, 1.0)
+    ax.set_zlim(-1.0, 1.0)
+    ax.set_axis_off()
+    ax.grid(False)
+    ax.view_init(elev=styles[0].elev, azim=states[0][i].azim)
+    _zoom_in(ax, styles[0].zoom)
+
+
+def _prep_overlay(projs, total_frames, hold_end, use_slerp, orbit_turns, style, colors):
+    """Build per-trace schedules to a common F, per-trace state lists, per-trace styles, and
+    attach _trace_xyz. Returns (states_list, styles_list, F)."""
+    # common F = the largest schedule across traces (so all orbit/finish together)
+    Fs = []
+    for proj in projs:
+        s = build_schedule(proj.traj_sphere.shape[0], total_frames, hold_end=hold_end)
+        Fs.append(s.total_frames)
+    F = max(Fs)
+    states, styles = [], []
+    for j, proj in enumerate(projs):
+        sch = build_schedule(proj.traj_sphere.shape[0], F, hold_end=hold_end)
+        stl = _trace_style(style, colors[j])
+        st = _precompute_states(proj, sch, sch.total_frames, use_slerp, orbit_turns, stl, hold_end)
+        proj._trace_xyz = _build_trace(proj.traj_sphere, use_slerp)
+        states.append(st)
+        styles.append(stl)
+    F = min(len(s) for s in states)
+    return states, styles, F
+
+
+def _ok_word(proj):
+    c = getattr(proj, "is_correct", None)
+    return "correct" if c is True else ("wrong" if c is False else "?")
+
+
+def render_collective_gif(
+    projected_runs,
+    out,
+    total_frames=72,
+    style=STYLE,
+    dpi=110,
+    fps=12,
+    orbit_turns=0.5,
+    use_slerp=True,
+    keep_frames=False,
+    hold_end=8,
+    cmap_name="tab10",
+    links=False,
+    title=None,
+    labels=None,
+):
+    """ONE shared sphere with every task trajectory overlaid, each in a distinct qualitative
+    color, each ending at its OWN correctness-colored labeled beacon (label prefixed with the
+    task key so overlapping beacons stay legible), slow shared orbit. links OFF by default
+    (busy with N traces)."""
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    cmap = _get_cmap(cmap_name)
+    ncol = getattr(cmap, "N", 10)
+    colors = [cmap(j % ncol) for j in range(len(projected_runs))]
+    if labels is None:
+        labels = [str(getattr(p, "_task_key", "") or "") for p in projected_runs]
+    prefixes = [(lbl + ": ") if lbl else "" for lbl in labels]
+
+    states, styles, F = _prep_overlay(
+        projected_runs, total_frames, hold_end, use_slerp, orbit_turns, style, colors
+    )
+
+    fig = plt.figure(figsize=(7.6, 7.6), dpi=dpi, facecolor=style.bg)
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.92)
+
+    frames = []
+    frame_dir = os.path.join(os.path.dirname(out) or ".", "frames_debug")
+    for i in range(F):
+        _draw_overlay_frame(ax, projected_runs, states, styles, i, links, prefixes)
+        tag = projected_runs[0].tag if projected_runs else ""
+        fig.suptitle(title or ("collective — %s (shared PCA frame)" % tag),
+                     color="w", fontsize=12)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, facecolor=style.bg)
+        buf.seek(0)
+        frames.append(imageio.imread(buf.getvalue()))
+        if keep_frames:
+            _dump_png(frame_dir, i, buf)
+    plt.close(fig)
+    _save_gif(out, frames, fps)
+    return out
+
+
+def render_collective_pair_gif(
+    runs_a,
+    runs_b,
+    out,
+    total_frames=72,
+    style=STYLE,
+    dpi=110,
+    fps=12,
+    orbit_turns=0.5,
+    use_slerp=True,
+    keep_frames=False,
+    hold_end=8,
+    cmap_name="tab10",
+    links=False,
+    labels_a=None,
+    labels_b=None,
+):
+    """Two collective spheres side by side (mirrors render_compare_gif's layout): model A's
+    tasks on the left sphere, model B's on the right."""
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    cmap = _get_cmap(cmap_name)
+    ncol = getattr(cmap, "N", 10)
+    colA = [cmap(j % ncol) for j in range(len(runs_a))]
+    colB = [cmap(j % ncol) for j in range(len(runs_b))]
+    if labels_a is None:
+        labels_a = [str(getattr(p, "_task_key", "") or "") for p in runs_a]
+    if labels_b is None:
+        labels_b = [str(getattr(p, "_task_key", "") or "") for p in runs_b]
+    prefA = [(l + ": ") if l else "" for l in labels_a]
+    prefB = [(l + ": ") if l else "" for l in labels_b]
+
+    stA, stylesA, FA = _prep_overlay(runs_a, total_frames, hold_end, use_slerp, orbit_turns, style, colA)
+    stB, stylesB, FB = _prep_overlay(runs_b, total_frames, hold_end, use_slerp, orbit_turns, style, colB)
+    F = min(FA, FB)
+
+    fig = plt.figure(figsize=(12, 6.6), dpi=dpi, facecolor=style.bg)
+    axL = fig.add_subplot(1, 2, 1, projection="3d")
+    axR = fig.add_subplot(1, 2, 2, projection="3d")
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.92, wspace=0.02)
+
+    frames = []
+    frame_dir = os.path.join(os.path.dirname(out) or ".", "frames_debug")
+    for i in range(F):
+        _draw_overlay_frame(axL, runs_a, stA, stylesA, i, links, prefA)
+        _draw_overlay_frame(axR, runs_b, stB, stylesB, i, links, prefB)
+        axL.set_title("%s (shared PCA frame)" % (runs_a[0].tag if runs_a else ""), color="w", fontsize=11)
+        axR.set_title("%s (shared PCA frame)" % (runs_b[0].tag if runs_b else ""), color="w", fontsize=11)
+        fig.suptitle("collective — all tasks per model", color="w", fontsize=12)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, facecolor=style.bg)
+        buf.seek(0)
+        frames.append(imageio.imread(buf.getvalue()))
+        if keep_frames:
+            _dump_png(frame_dir, i, buf)
+    plt.close(fig)
+    _save_gif(out, frames, fps)
+    return out
+
+
+def render_rescue_gif(
+    proj_simple,
+    proj_detailed,
+    out,
+    total_frames=72,
+    style=STYLE,
+    dpi=110,
+    fps=12,
+    orbit_turns=0.5,
+    use_slerp=True,
+    keep_frames=False,
+    hold_end=8,
+    simple_rgb=(0.95, 0.45, 0.20),
+    detailed_rgb=(0.30, 0.65, 1.0),
+    task_label="",
+    model_tag="",
+    links=True,
+):
+    """Overlay two variant trajectories of ONE task on ONE shared sphere. Each trace its own
+    color (simple=orange, detailed=blue); each ends at its correctness-colored beacon (simple
+    typically RED, detailed GREEN). A RED->GREEN flip shows as the detailed path turning to a
+    different region. Slow orbit. links=True (only two traces) so the 'turn' is legible."""
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    projs = [proj_simple, proj_detailed]
+    colors = [simple_rgb, detailed_rgb]
+    prefixes = ["simple ", "detailed "]
+    states, styles, F = _prep_overlay(
+        projs, total_frames, hold_end, use_slerp, orbit_turns, style, colors
+    )
+
+    ok_s, ok_d = _ok_word(proj_simple), _ok_word(proj_detailed)
+    suptitle = "RESCUE — %s%s: simple(orange)->%s vs detailed(blue)->%s" % (
+        task_label, (" on %s" % model_tag) if model_tag else "", ok_s, ok_d
+    )
+
+    fig = plt.figure(figsize=(7.6, 7.6), dpi=dpi, facecolor=style.bg)
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.90)
+
+    frames = []
+    frame_dir = os.path.join(os.path.dirname(out) or ".", "frames_debug")
+    for i in range(F):
+        _draw_overlay_frame(ax, projs, states, styles, i, links, prefixes)
+        fig.suptitle(suptitle, color="w", fontsize=11)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=dpi, facecolor=style.bg)
         buf.seek(0)

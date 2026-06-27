@@ -62,6 +62,10 @@ class ProjectedRun:
     pred_token_str: str
     N: int
     topk: int
+    # ---- v2 additive: carry generated answer + correctness onto the projection ----
+    answer_text: str = ""
+    is_correct: object = None    # True/False/None
+    gold: str = ""
 
 
 def _build_union(runs, subsample_cols, seed):
@@ -156,4 +160,8 @@ def project_run(frame, run):
         pred_token_str=run.pred_token_str,
         N=run.N,
         topk=run.topk,
+        # duck-typed getattr so even a smoke run without these fields projects cleanly.
+        answer_text=getattr(run, "answer_text", ""),
+        is_correct=getattr(run, "is_correct", None),
+        gold=getattr(run, "gold", ""),
     )
