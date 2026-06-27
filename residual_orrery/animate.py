@@ -57,24 +57,63 @@ def _save_gif(out, frames, fps):
 # ----------------------------------------------------------------------------
 @dataclass
 class GlowStyle:
-    bg: str = "black"
-    sphere_wire: tuple = (1, 1, 1, 0.08)
-    static_rgba: tuple = (0.55, 0.60, 0.72, 0.18)
-    static_s: float = 6.0
+    bg: str = "#04050a"                                  # near-black with a hint of blue
+    sphere_wire: tuple = (0.42, 0.58, 0.92, 0.32)        # brighter blue wire (was alpha 0.08)
+    wire_lw: float = 0.6
+    static_rgba: tuple = (0.74, 0.80, 0.96, 0.45)        # brighter, more opaque stars
+    static_s: float = 11.0
     cmap_name: str = "plasma"
-    s_min: float = 8.0
-    s_max: float = 130.0
+    s_min: float = 14.0
+    s_max: float = 240.0
     marker_rgba: tuple = (1.0, 1.0, 1.0, 1.0)
-    marker_s: float = 90.0
-    tail_len: int = 6
-    tail_alpha0: float = 0.5
+    marker_s: float = 130.0
+    # persistent accumulating trace (the hop path drawn on the sphere, like the sketch)
+    trace_rgba: tuple = (0.20, 1.0, 0.80, 0.95)          # bright cyan/teal path
+    trace_lw: float = 2.4
+    node_dim_rgba: tuple = (0.55, 0.62, 0.85, 0.55)      # not-yet-visited node dot
+    node_hot_rgba: tuple = (1.0, 0.95, 0.55, 1.0)        # visited node dot (warm)
+    node_s: float = 26.0
     target_rgba: tuple = (1.0, 0.84, 0.0, 1.0)
     elev: float = 18.0
     azim0: float = -60.0
-    wire_stride: int = 18
+    wire_stride: int = 16
+    zoom: float = 1.5                                    # blow the unit sphere up in-panel
 
 
 STYLE = GlowStyle()
+
+# Dense points sampled along EACH trajectory segment for the persistent great-circle trace.
+PTS_PER_SEG = 22
+
+
+def _build_trace(traj, use_slerp=True):
+    """Full hop path as a dense great-circle polyline on S^2 -> [M, 3], M = (P-1)*PTS_PER_SEG.
+    Segment s occupies rows [s*PTS_PER_SEG : (s+1)*PTS_PER_SEG], matching the reveal count
+    computed in _precompute_states, so the drawn trace exactly tracks the marker."""
+    P = traj.shape[0]
+    pts = []
+    for s in range(P - 1):
+        p0, p1 = traj[s], traj[s + 1]
+        for k in range(PTS_PER_SEG):
+            tt = (k + 1) / PTS_PER_SEG
+            pts.append(slerp(p0, p1, tt) if use_slerp else _lerp_renorm(p0, p1, tt))
+    if not pts:
+        return np.zeros((0, 3), np.float64)
+    return np.asarray(pts, np.float64)
+
+
+def _zoom_in(ax, zoom):
+    """Make the unit sphere fill more of the panel, version-safely. Modern mpl: set_box_aspect
+    with a zoom kwarg. Old mpl 3.2: shrink ax.dist (smaller = closer)."""
+    try:
+        ax.set_box_aspect((1, 1, 1), zoom=zoom)   # mpl >= ~3.3
+        return
+    except Exception:
+        pass
+    try:
+        ax.dist = 10.0 / float(zoom)              # mpl 3.2
+    except Exception:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -181,6 +220,8 @@ class FrameState:
     azim: float
     hud: str
     global_hud: str
+    trace_reveal: int = 0    # how many polyline points of the persistent trace to draw
+    nodes_visited: int = 0   # how many trajectory nodes the hop has reached
 
 
 def _minmax(x, eps=1e-8):
@@ -230,7 +271,14 @@ def _precompute_states(proj, sched, total_frames, use_slerp, orbit_turns, style,
         azim = style.azim0 + 360.0 * orbit_turns * (i / max(sched.total_frames - 1, 1))
 
         tail_positions.append(xyz)
-        tail = [np.asarray(p) for p in tail_positions[-style.tail_len :]]
+        tail = [np.asarray(p) for p in tail_positions]   # full persistent tail (unused for trace)
+
+        # persistent trace reveal: segment s rows are [s*PTS_PER_SEG : (s+1)*PTS_PER_SEG],
+        # so reveal up to the marker's current fraction within its segment.
+        seg = int(sched.seg_of_frame[i])
+        reveal = seg * PTS_PER_SEG + int(round(t * PTS_PER_SEG))
+        reveal = min(reveal, max(P - 1, 0) * PTS_PER_SEG)
+        nodes_visited = min(active_node + 1, P)
 
         hud = _panel_hud(proj, kind, layer)
         states.append(
@@ -245,6 +293,8 @@ def _precompute_states(proj, sched, total_frames, use_slerp, orbit_turns, style,
                 azim=float(azim),
                 hud=hud,
                 global_hud="",
+                trace_reveal=int(reveal),
+                nodes_visited=int(nodes_visited),
             )
         )
     return states
@@ -270,7 +320,7 @@ def _draw_wire_sphere(ax, style):
     xs = np.outer(np.cos(u), np.sin(v))
     ys = np.outer(np.sin(u), np.sin(v))
     zs = np.outer(np.ones_like(u), np.cos(v))
-    ax.plot_wireframe(xs, ys, zs, linewidth=0.3, color=style.sphere_wire)
+    ax.plot_wireframe(xs, ys, zs, linewidth=style.wire_lw, color=style.sphere_wire)
 
 
 def _draw_static_stars(ax, proj, style):
@@ -340,31 +390,34 @@ def _draw_unembed(ax, proj, fstate, style):
         )
 
 
-def _draw_marker_and_tail(ax, fstate, style):
-    tail = fstate.tail
-    n = len(tail)
-    for k, p in enumerate(tail[:-1]):
-        frac = (k + 1) / max(n, 1)
-        alpha = style.tail_alpha0 * frac
-        ax.scatter(
-            [p[0]],
-            [p[1]],
-            [p[2]],
-            s=style.marker_s * 0.4 * frac,
-            c=[(1.0, 1.0, 1.0, alpha)],
-            depthshade=False,
-            edgecolors="none",
-        )
+def _draw_trace(ax, proj, fstate, style):
+    """Persistent accumulating hop path drawn ON the sphere (great-circle polyline) plus a dot at
+    every trajectory node — visited nodes warm, upcoming nodes dim. The line grows as the marker
+    hops and stays drawn (during the end hold the WHOLE route is visible, like the sketch)."""
+    trace = getattr(proj, "_trace_xyz", None)
+    r = int(fstate.trace_reveal)
+    if trace is not None and r >= 2:
+        seg = trace[:r]
+        ax.plot(seg[:, 0], seg[:, 1], seg[:, 2],
+                color=style.trace_rgba[:3], alpha=style.trace_rgba[3],
+                linewidth=style.trace_lw, solid_capstyle="round")
+    # node dots: every trajectory node, brightened once visited
+    nodes = proj.traj_sphere  # [P, 3]
+    nv = int(fstate.nodes_visited)
+    if nv < len(nodes):
+        up = nodes[nv:]
+        ax.scatter(up[:, 0], up[:, 1], up[:, 2], s=style.node_s * 0.7,
+                   c=[style.node_dim_rgba], depthshade=False, edgecolors="none")
+    if nv > 0:
+        vis = nodes[:nv]
+        ax.scatter(vis[:, 0], vis[:, 1], vis[:, 2], s=style.node_s,
+                   c=[style.node_hot_rgba], depthshade=False, edgecolors="none")
+    # bright moving head
     m = fstate.marker_xyz
-    ax.scatter(
-        [m[0]],
-        [m[1]],
-        [m[2]],
-        s=style.marker_s,
-        c=[style.marker_rgba],
-        depthshade=False,
-        edgecolors="none",
-    )
+    ax.scatter([m[0]], [m[1]], [m[2]], s=style.marker_s, c=[style.marker_rgba],
+               depthshade=False, edgecolors="none")
+    ax.scatter([m[0]], [m[1]], [m[2]], s=style.marker_s * 2.4,    # soft halo around the head
+               c=[(1.0, 1.0, 1.0, 0.18)], depthshade=False, edgecolors="none")
 
 
 def _blacken_3d_axes(ax, style):
@@ -392,16 +445,17 @@ def render_panel(ax, proj, fstate, style):
     _draw_static_stars(ax, proj, style)
     _draw_active_glow(ax, proj, fstate, style)
     _draw_unembed(ax, proj, fstate, style)
-    _draw_marker_and_tail(ax, fstate, style)
+    _draw_trace(ax, proj, fstate, style)
     # equal cube via equal limits (mpl 3.2 has NO set_box_aspect; set_aspect('equal') raises)
-    ax.set_xlim(-1.05, 1.05)
-    ax.set_ylim(-1.05, 1.05)
-    ax.set_zlim(-1.05, 1.05)
+    ax.set_xlim(-1.0, 1.0)
+    ax.set_ylim(-1.0, 1.0)
+    ax.set_zlim(-1.0, 1.0)
     ax.set_axis_off()
     ax.grid(False)
     ax.view_init(elev=style.elev, azim=fstate.azim)
+    _zoom_in(ax, style.zoom)   # blow the sphere up so it fills the panel
     ax.text2D(
-        0.02, 0.95, fstate.hud, transform=ax.transAxes, color="white", fontsize=9
+        0.02, 0.95, fstate.hud, transform=ax.transAxes, color="white", fontsize=10
     )
 
 
@@ -439,8 +493,10 @@ def render_compare_gif(
 
     stA = _precompute_states(proj_a, schA, F, use_slerp, orbit_turns, style, hold_end)
     stB = _precompute_states(proj_b, schB, F, use_slerp, orbit_turns, style, hold_end)
+    proj_a._trace_xyz = _build_trace(proj_a.traj_sphere, use_slerp)
+    proj_b._trace_xyz = _build_trace(proj_b.traj_sphere, use_slerp)
 
-    fig = plt.figure(figsize=(12, 6), dpi=dpi, facecolor=style.bg)
+    fig = plt.figure(figsize=(12, 6.6), dpi=dpi, facecolor=style.bg)
     axL = fig.add_subplot(1, 2, 1, projection="3d")
     axR = fig.add_subplot(1, 2, 2, projection="3d")
     fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.92, wspace=0.02)
@@ -487,6 +543,7 @@ def render_single_gif(
     sch = build_schedule(proj.traj_sphere.shape[0], total_frames, hold_end=hold_end)
     F = sch.total_frames
     st = _precompute_states(proj, sch, F, use_slerp, orbit_turns, style, hold_end)
+    proj._trace_xyz = _build_trace(proj.traj_sphere, use_slerp)
 
     fig = plt.figure(figsize=(7, 7), dpi=dpi, facecolor=style.bg)
     ax = fig.add_subplot(1, 1, 1, projection="3d")
