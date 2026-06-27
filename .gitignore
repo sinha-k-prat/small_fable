@@ -19,9 +19,17 @@ rl_ckpt/
 rl_rollouts.jsonl
 *_rollouts.jsonl
 
+# residual_orrery generated artifacts (GIFs, npz cache, debug PNGs)
+/out/
+residual_orrery/out/
+
 # Misc
 .DS_Store
 *.log
 wandb/
 plan_vocab.json
 out_*
+
+# python packaging
+*.egg-info/
+__pycache__/

@@ -1,0 +1,51 @@
+[build-system]
+# setuptools >=61 understands [project] metadata in pyproject.toml (PEP 621).
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "residual_orrery"
+version = "0.1.0"
+description = "Mechanistic-interpretability visualization: the residual stream as an orrery of down_proj writer-direction stars on S^2, with a hop animation comparing Qwen2.5 0.5B vs 1.5B."
+readme = "residual_orrery/README.md"
+# The pinned local env is CPython 3.8; floor at 3.8 so it installs both here and on Colab.
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Pratyushkumarsinha" }]
+keywords = [
+    "mechanistic-interpretability",
+    "transformers",
+    "residual-stream",
+    "qwen2",
+    "visualization",
+]
+
+# Dependency floors, NOT pins. Each floor is at or below the verified local version
+# (torch 2.2.2 / transformers 4.44.2 / numpy 1.20.1 / matplotlib 3.2.2 /
+#  scikit-learn 0.23.1 / Pillow 7.2.0 / imageio 2.9.0) so this same spec resolves on
+# the frozen local stack AND on a newer environment (e.g. Colab).
+dependencies = [
+    "torch>=2.2.2",
+    "transformers>=4.44.2",
+    "numpy>=1.20.1",
+    "matplotlib>=3.2.2",
+    "scikit-learn>=0.23.1",
+    "Pillow>=7.2.0",
+    "imageio>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/sinha-k-prat/small_fable"
+Repository = "https://github.com/sinha-k-prat/small_fable"
+
+[project.scripts]
+# Console entry point -> the argparse CLI. Same target as `python -m residual_orrery`.
+residual-orrery = "residual_orrery.cli:main"
+
+[tool.setuptools]
+# Ship ONLY the package; this repo has many unrelated top-level modules, so do not
+# let auto-discovery scan the whole tree.
+packages = ["residual_orrery"]
