@@ -46,7 +46,7 @@ def build_compare(
     enrich_pca=True,
     use_cache=True,
     generate=False,
-    gen_tokens=24,
+    gen_tokens=512,
 ):
     """Load both bundles, collect (cached), fit a per-model PCA frame, project the
     chosen example. Returns a CompareResult with no rendering done. ``generate=True`` makes
@@ -86,7 +86,7 @@ def run_compare(
     single=False,
     use_cache=True,
     generate=False,
-    gen_tokens=24,
+    gen_tokens=512,
 ):
     """Full pipeline -> GIF(s) in out_dir. Returns CompareResult with gif_paths set."""
     os.makedirs(out_dir, exist_ok=True)
@@ -154,7 +154,7 @@ def build_collective(
     topk=48,
     cache_dir="out/cache",
     generate=True,
-    gen_tokens=24,
+    gen_tokens=512,
     use_cache=True,
 ):
     """Per model: collect ALL tasks of VARIANTS[variant] (with generation+correctness), fit
@@ -193,7 +193,7 @@ def run_collective(
     use_slerp=True,
     keep_frames=False,
     generate=True,
-    gen_tokens=24,
+    gen_tokens=512,
     use_cache=True,
 ):
     """1 model -> single collective sphere GIF (render_collective_gif).

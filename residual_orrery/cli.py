@@ -20,8 +20,8 @@ def build_parser():
                    help="instruction variant for single/compare/collective")
     p.add_argument("--task", default=None,
                    help="rescue/single task: int index OR key (e.g. 'mult')")
-    p.add_argument("--gen_tokens", type=int, default=24,
-                   help="greedy answer cap (mult auto-bumps to 256 via Task)")
+    p.add_argument("--gen_tokens", type=int, default=512,
+                   help="greedy gen cap; generation stops at EOS, this is the safety max")
     p.add_argument("--no-generate", dest="generate", action="store_false",
                    help="skip greedy generation (beacons render amber)")
     p.set_defaults(generate=True)

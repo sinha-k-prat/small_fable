@@ -22,7 +22,7 @@ class Task:
     user: str           # user prompt
     gold: str           # gold answer text
     grade: str          # "digits" | "substr" | "equal"  -> RunCollection.grade_mode
-    gen_tokens: int     # per-task greedy cap (mult=256; others small)
+    gen_tokens: int     # per-task EOS-safety cap (generation stops at <|im_end|>; this is just the max)
 
 
 TASK_KEYS = ["add", "antonym", "capital", "prime", "reverse", "mult"]
@@ -69,44 +69,44 @@ def build_input_ids(bundle, prompt, system=None):
 EXAMPLES_PLAIN = [
     Task("add", None,
          "What is 17 plus 25? Reply with just the number.",
-         "42", "digits", 8),
+         "42", "digits", 512),
     Task("antonym", None,
          "Give one word that means the opposite of 'hot'.",
-         "cold", "substr", 8),
+         "cold", "substr", 512),
     Task("capital", None,
          "Complete the sentence: The capital of France is",
-         "Paris", "substr", 8),
+         "Paris", "substr", 512),
     Task("prime", None,
          "Is 7 a prime number? Answer yes or no.",
-         "yes", "substr", 8),
+         "yes", "substr", 512),
     Task("reverse", None,
          "Reverse the letters of the word 'cat'.",
-         "tac", "substr", 8),
+         "tac", "substr", 512),
     Task("mult", None,
          "Compute the exact product: 9246 x 897. Reply with just the number.",
-         "8293662", "digits", 256),
+         "8293662", "digits", 768),
 ]
 
 # SIMPLE: terse prompts where the small model tends to FAIL. system=None.
 EXAMPLES_SIMPLE = [
     Task("add", None,
          "What is 17 plus 25? Reply with just the number.",
-         "42", "digits", 8),
+         "42", "digits", 512),
     Task("antonym", None,
          "Give one word that means the opposite of 'hot'. Reply with one word.",
-         "cold", "substr", 8),
+         "cold", "substr", 512),
     Task("capital", None,
          "The capital of France is",
-         "Paris", "substr", 8),
+         "Paris", "substr", 512),
     Task("prime", None,
          "Is 7 a prime number? Answer yes or no.",
-         "yes", "substr", 8),
+         "yes", "substr", 512),
     Task("reverse", None,
          "Reverse the letters of the word 'cat'. Reply with just the reversed word.",
-         "tac", "substr", 8),
+         "tac", "substr", 512),
     Task("mult", None,
          "Compute the exact product: 9246 x 897. Reply with just the number.",
-         "8293662", "digits", 256),
+         "8293662", "digits", 768),
 ]
 
 # DETAILED: every task shares ONE system message (so the notebook can quote it once).
@@ -122,29 +122,29 @@ EXAMPLES_DETAILED = [
          "Add 17 and 25. Add column by column from the right: add the ones digits (7 + 5), "
          "write the ones digit of that sum and carry any tens; then add the tens digits plus "
          "the carry. Combine the digits.",
-         "42", "digits", 8),
+         "42", "digits", 512),
     Task("antonym", _DETAILED_SYSTEM,
          "Find one word that is the opposite of 'hot'. State the dimension the word varies "
          "along, then name the word at the far opposite end of that dimension from 'hot'.",
-         "cold", "substr", 8),
+         "cold", "substr", 512),
     Task("capital", _DETAILED_SYSTEM,
          "Name the capital city of France. State the country, then recall the city that is its "
          "seat of national government.",
-         "Paris", "substr", 8),
+         "Paris", "substr", 512),
     Task("prime", _DETAILED_SYSTEM,
          "Determine whether 7 is prime. A prime has exactly two distinct positive divisors, 1 "
          "and itself. Test each integer d from 2 up to 6 and state whether d divides 7 evenly. "
          "If none divide it, it is prime. Answer yes or no.",
-         "yes", "substr", 8),
+         "yes", "substr", 512),
     Task("reverse", _DETAILED_SYSTEM,
          "Reverse the letters of the word 'cat'. List its letters in order, numbering them. "
          "Then write the letters from the last numbered one to the first, concatenated.",
-         "tac", "substr", 8),
+         "tac", "substr", 512),
     Task("mult", _DETAILED_SYSTEM,
          "Compute 9246 x 897. Multiply by long multiplication: multiply the top number by each "
          "digit of the bottom number (write each partial product, shifted by place), then add "
          "the partial products.",
-         "8293662", "digits", 256),
+         "8293662", "digits", 768),
 ]
 
 
